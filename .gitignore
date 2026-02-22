@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+env/
+.venv/
+ENV/
+
+# Generated data & pipeline output
+bigquery/data/
+bigquery/*.csv
+Ramp/
+
+# Excel source data (large, sensitive)
+*.xlsx
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Cursor IDE (keep skills/rules, ignore transient project state)
+.cursor/projects/
+
+# OS artifacts
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Logs & temp
+*.log
+*.tmp
+*.bak
+
+# Environment / secrets
+.env
+.env.*
+
+# Docker build context (handled by .dockerignore)
