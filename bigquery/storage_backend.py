@@ -1,9 +1,13 @@
 """
-Storage backend that abstracts local filesystem vs Google Cloud Storage.
+Storage backend that abstracts local filesystem vs Google Cloud Storage,
+with optional BigQuery write-through for the capex_analytics dataset.
 
 When the GCS_BUCKET environment variable is set, all reads/writes go to that
 GCS bucket.  Otherwise, everything falls back to the local ``data/`` directory
 so local development is unchanged.
+
+When BQ_ANALYTICS_DATASET is set (or BigQuery helpers are called explicitly),
+pipeline exports are also written to BigQuery tables via ``bq_dataset``.
 """
 from __future__ import annotations
 
@@ -119,3 +123,79 @@ def local_data_dir() -> Path:
     """Return the local data directory (for pipeline steps that need local temp files)."""
     _LOCAL_DATA_DIR.mkdir(exist_ok=True)
     return _LOCAL_DATA_DIR
+
+
+# ---------------------------------------------------------------------------
+# BigQuery helpers -- thin wrappers around bq_dataset for convenience
+# ---------------------------------------------------------------------------
+
+_CSV_TO_BQ_TABLE: dict[str, str] = {
+    "capex_clean.csv": "po_lines",
+    "capex_by_station.csv": "station_summary",
+    "spares_catalog.csv": "spares_catalog",
+}
+
+
+def write_to_bigquery(
+    csv_name: str,
+    df: pd.DataFrame,
+    *,
+    write_disposition: str = "WRITE_TRUNCATE",
+) -> int:
+    """Write a DataFrame to the BigQuery table that corresponds to a CSV name.
+
+    Returns the number of rows written, or 0 if the CSV has no BQ mapping.
+    """
+    table_name = _CSV_TO_BQ_TABLE.get(csv_name)
+    if table_name is None:
+        return 0
+    import bq_dataset
+    return bq_dataset.write_table(table_name, df, write_disposition=write_disposition)
+
+
+def read_from_bigquery(table_name: str, where: str = "") -> pd.DataFrame:
+    """Read a table from the capex_analytics BigQuery dataset."""
+    import bq_dataset
+    return bq_dataset.read_table(table_name, where=where)
+
+
+# ---------------------------------------------------------------------------
+# Push local clean data to GCS (for use after a local pipeline run)
+# ---------------------------------------------------------------------------
+
+# Files produced by the pipeline that should be pushed to cloud for dashboard/review.
+CLEAN_DATA_FILES: list[str] = [
+    "capex_clean.csv",
+    "capex_by_station.csv",
+    "spares_catalog.csv",
+    "bf1_stations.json",
+    "forecast_overrides.json",
+    "dashboard_settings.json",
+    "station_overrides.json",
+    "ramp_accounting.json",
+]
+
+
+def push_clean_data_to_gcs(bucket_name: str) -> list[str]:
+    """Upload clean data files from local data/ to the given GCS bucket.
+
+    Returns the list of gs:// URIs uploaded. Skips files that do not exist locally.
+    """
+    from google.cloud import storage as gcs
+
+    client = gcs.Client()
+    bucket = client.bucket(bucket_name)
+    data_dir = local_data_dir()
+    uploaded: list[str] = []
+
+    for name in CLEAN_DATA_FILES:
+        path = data_dir / name
+        if not path.exists():
+            continue
+        blob = bucket.blob(name)
+        content_type = "text/csv" if name.endswith(".csv") else "application/json"
+        blob.upload_from_filename(str(path), content_type=content_type)
+        uri = f"gs://{bucket_name}/{name}"
+        uploaded.append(uri)
+
+    return uploaded

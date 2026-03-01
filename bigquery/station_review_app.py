@@ -6,7 +6,9 @@ Open: http://localhost:5051
 """
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 from flask import Flask, jsonify, render_template_string, request
@@ -38,6 +40,325 @@ def _save_overrides(overrides: dict) -> None:
 
 def _load_data() -> pd.DataFrame:
     return store.read_csv("capex_clean.csv")
+
+
+MANUAL_REQUIRED_FIELDS: tuple[str, ...] = (
+    "po_number",
+    "date_order",
+    "vendor_name",
+    "item_description",
+    "price_subtotal",
+)
+
+MANUAL_PROJECT_CODES: list[str] = [
+    "BF1-NPI & Pilot Equipment",
+    "BF1-Prototype R&D Lines",
+    "BF1-Quality Equipment",
+    "BF1-Facilities and Infrastructure",
+    "BF1-Manufacturing IT Systems",
+    "BF1-Warehousing and Material Handling",
+    "BF1-Maintenance and Spares",
+    "BF1-Module Line 1",
+    "BF1-Module Line 2",
+    "BF1-Inverter Line 1",
+    "BF1-Other Allocation",
+]
+
+MANUAL_SUBCATEGORY_OPTIONS: list[str] = [
+    "Process Equipment",
+    "Controls & Electrical",
+    "Mechanical & Structural",
+    "Consumables",
+    "MFG Tools & Shop Supplies",
+    "Design & Engineering Services",
+    "Integration & Commissioning",
+    "Quality & Metrology",
+    "Software & Licenses",
+    "Shipping & Freight",
+    "Facilities & Office",
+    "IT Equipment",
+    "General & Administrative",
+]
+
+MANUAL_DEFAULT_COLUMNS: list[str] = [
+    "source", "po_number", "date_order", "po_state", "po_invoice_status", "po_receipt_status",
+    "vendor_name", "vendor_ref",
+    "product_category", "item_description", "is_capex",
+    "station_id", "station_name", "mapping_confidence", "mapping_reason", "mapping_status",
+    "mfg_subcategory", "subcat_confidence", "subcat_reason", "is_mfg",
+    "product_id", "product_qty", "qty_received", "product_uom",
+    "price_unit", "price_subtotal", "price_tax", "price_total",
+    "bill_count", "bill_amount_total", "bill_amount_paid", "bill_amount_open", "bill_payment_status",
+    "project_name", "created_by_name",
+    "po_amount_total", "po_notes", "part_numbers", "line_id",
+    "po_id", "vendor_partner_id", "vendor_email", "line_sequence", "line_description",
+    "line_date_planned", "responsible_user_id", "created_by_user_id", "po_amount_untaxed",
+    "po_amount_tax", "incoterm_id", "ramp_card", "ramp_department", "ramp_location",
+    "ramp_category", "ramp_merchant", "line_type",
+]
+
+
+def _to_str(value: Any) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if text.lower() in {"nan", "none", "null", "undefined"}:
+        return ""
+    return text
+
+
+def _to_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        text = _to_str(value)
+        if text == "":
+            return default
+        return float(text)
+    except (TypeError, ValueError):
+        return default
+
+
+def _to_date_yyyy_mm_dd(value: Any) -> str:
+    text = _to_str(value)
+    if text == "":
+        return ""
+    ts = pd.to_datetime(text, errors="coerce")
+    if pd.isna(ts):
+        return ""
+    return ts.strftime("%Y-%m-%d")
+
+
+def _csv_safe(df: pd.DataFrame) -> pd.DataFrame:
+    return df.astype("object").where(pd.notna(df), "")
+
+
+def _manual_line_id(payload: dict[str, Any]) -> str:
+    stable_key = "|".join(
+        [
+            _to_str(payload.get("po_number")).lower(),
+            _to_date_yyyy_mm_dd(payload.get("date_order")),
+            _to_str(payload.get("vendor_name")).lower(),
+            _to_str(payload.get("item_description")).lower(),
+            f"{_to_float(payload.get('price_subtotal')):.2f}",
+        ]
+    )
+    digest = hashlib.md5(stable_key.encode("utf-8")).hexdigest()[:12].upper()
+    return f"MANUAL-{digest}"
+
+
+def _station_name_for(station_id: str) -> str:
+    if not station_id:
+        return ""
+    stations = _load_stations()
+    match = next((s for s in stations if _to_str(s.get("station_id")) == station_id), None)
+    return _to_str(match.get("process_name")) if match else ""
+
+
+def _manual_po_defaults(payload: dict[str, Any], line_id: str) -> dict[str, Any]:
+    station_id = _to_str(payload.get("station_id"))
+    station_name = _to_str(payload.get("station_name")) or _station_name_for(station_id)
+    subtotal = _to_float(payload.get("price_subtotal"), 0.0)
+    qty = _to_float(payload.get("product_qty"), 1.0)
+    if qty <= 0:
+        qty = 1.0
+    unit = _to_float(payload.get("price_unit"), subtotal / qty if qty else subtotal)
+    total = _to_float(payload.get("price_total"), subtotal)
+    tax = _to_float(payload.get("price_tax"), max(total - subtotal, 0.0))
+    mapping_status = _to_str(payload.get("mapping_status")) or "confirmed"
+
+    row: dict[str, Any] = {
+        "source": "manual",
+        "po_number": _to_str(payload.get("po_number")),
+        "date_order": _to_date_yyyy_mm_dd(payload.get("date_order")),
+        "po_state": _to_str(payload.get("po_state")) or "purchase",
+        "po_invoice_status": _to_str(payload.get("po_invoice_status")),
+        "po_receipt_status": _to_str(payload.get("po_receipt_status")),
+        "vendor_name": _to_str(payload.get("vendor_name")),
+        "vendor_ref": _to_str(payload.get("vendor_ref")),
+        "product_category": _to_str(payload.get("product_category")),
+        "item_description": _to_str(payload.get("item_description")),
+        "is_capex": True,
+        "station_id": station_id,
+        "station_name": station_name,
+        "mapping_confidence": "manual",
+        "mapping_reason": _to_str(payload.get("mapping_reason")) or "manual PO entry",
+        "mapping_status": mapping_status,
+        "mfg_subcategory": _to_str(payload.get("mfg_subcategory")),
+        "subcat_confidence": _to_str(payload.get("subcat_confidence")),
+        "subcat_reason": _to_str(payload.get("subcat_reason")),
+        "is_mfg": True,
+        "product_id": _to_str(payload.get("product_id")),
+        "product_qty": qty,
+        "qty_received": _to_float(payload.get("qty_received"), 0.0),
+        "product_uom": _to_str(payload.get("product_uom")) or "Units",
+        "price_unit": unit,
+        "price_subtotal": subtotal,
+        "price_tax": tax,
+        "price_total": total if total else subtotal,
+        "bill_count": _to_float(payload.get("bill_count"), 0.0),
+        "bill_amount_total": _to_float(payload.get("bill_amount_total"), 0.0),
+        "bill_amount_paid": _to_float(payload.get("bill_amount_paid"), 0.0),
+        "bill_amount_open": _to_float(payload.get("bill_amount_open"), 0.0),
+        "bill_payment_status": _to_str(payload.get("bill_payment_status")),
+        "project_name": _to_str(payload.get("project_name")),
+        "created_by_name": _to_str(payload.get("created_by_name")) or "manual_entry",
+        "po_amount_total": _to_float(payload.get("po_amount_total"), subtotal),
+        "po_notes": _to_str(payload.get("po_notes")),
+        "part_numbers": _to_str(payload.get("part_numbers")) or "[]",
+        "line_id": line_id,
+        "po_id": _to_str(payload.get("po_id")),
+        "vendor_partner_id": _to_str(payload.get("vendor_partner_id")),
+        "vendor_email": _to_str(payload.get("vendor_email")),
+        "line_sequence": _to_str(payload.get("line_sequence")),
+        "line_description": _to_str(payload.get("line_description")) or _to_str(payload.get("item_description")),
+        "line_date_planned": _to_date_yyyy_mm_dd(payload.get("line_date_planned")),
+        "responsible_user_id": _to_str(payload.get("responsible_user_id")),
+        "created_by_user_id": _to_str(payload.get("created_by_user_id")),
+        "po_amount_untaxed": _to_float(payload.get("po_amount_untaxed"), subtotal),
+        "po_amount_tax": _to_float(payload.get("po_amount_tax"), tax),
+        "incoterm_id": _to_str(payload.get("incoterm_id")),
+        "ramp_card": "",
+        "ramp_department": "",
+        "ramp_location": "",
+        "ramp_category": "",
+        "ramp_merchant": "",
+        "line_type": "spend",
+    }
+    return row
+
+
+def _validate_manual_payload(payload: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    for field in MANUAL_REQUIRED_FIELDS:
+        if _to_str(payload.get(field)) == "":
+            errors.append(f"{field} is required")
+
+    if _to_date_yyyy_mm_dd(payload.get("date_order")) == "":
+        errors.append("date_order must be a valid date")
+
+    subtotal_text = _to_str(payload.get("price_subtotal"))
+    try:
+        float(subtotal_text)
+    except (TypeError, ValueError):
+        errors.append("price_subtotal must be a valid number")
+
+    project_name = _to_str(payload.get("project_name"))
+    if project_name and project_name not in MANUAL_PROJECT_CODES:
+        errors.append("project_name must be one of the supported manufacturing projects")
+
+    subcat = _to_str(payload.get("mfg_subcategory"))
+    if subcat and subcat not in MANUAL_SUBCATEGORY_OPTIONS:
+        errors.append("mfg_subcategory must be one of the supported sub-categories")
+
+    return errors
+
+
+def _upsert_manual_po(payload: dict[str, Any], line_id: str | None = None) -> dict[str, Any]:
+    df = _load_data()
+    if df.empty:
+        df = pd.DataFrame(columns=MANUAL_DEFAULT_COLUMNS)
+
+    target_line_id = _to_str(line_id) or _to_str(payload.get("line_id")) or _manual_line_id(payload)
+
+    mask = pd.Series([False] * len(df))
+    if "line_id" in df.columns and "source" in df.columns:
+        mask = (df["line_id"].astype(str) == target_line_id) & (df["source"].astype(str) == "manual")
+
+    if line_id and not bool(mask.any()):
+        raise KeyError("manual row not found")
+
+    existing: dict[str, Any] = {}
+    if bool(mask.any()):
+        existing = df.loc[mask].iloc[0].to_dict()
+
+    row = _manual_po_defaults(payload, target_line_id)
+    merged = {**existing, **row}
+
+    for col in merged.keys():
+        if col not in df.columns:
+            df[col] = ""
+
+    if bool(mask.any()):
+        idx = df.index[mask][0]
+        for col, val in merged.items():
+            df.at[idx, col] = val
+    else:
+        df = pd.concat([df, pd.DataFrame([merged])], ignore_index=True)
+
+    dest_cols = list(dict.fromkeys(MANUAL_DEFAULT_COLUMNS + list(df.columns)))
+    for col in dest_cols:
+        if col not in df.columns:
+            df[col] = ""
+    df = df[dest_cols]
+    store.write_csv("capex_clean.csv", _csv_safe(df))
+    return merged
+
+
+def _update_manual_po_subcategory(line_id: str, mfg_subcategory: str) -> dict[str, Any]:
+    line_id = _to_str(line_id)
+    if not line_id:
+        raise KeyError("manual row not found")
+
+    normalized = _to_str(mfg_subcategory)
+    if normalized and normalized not in MANUAL_SUBCATEGORY_OPTIONS:
+        raise ValueError("mfg_subcategory must be one of the supported sub-categories")
+
+    df = _load_data()
+    if df.empty or "line_id" not in df.columns or "source" not in df.columns:
+        raise KeyError("manual row not found")
+
+    mask = (df["line_id"].astype(str) == line_id) & (df["source"].astype(str) == "manual")
+    if not bool(mask.any()):
+        raise KeyError("manual row not found")
+
+    if "mfg_subcategory" not in df.columns:
+        df["mfg_subcategory"] = ""
+    if "subcat_confidence" not in df.columns:
+        df["subcat_confidence"] = ""
+    if "subcat_reason" not in df.columns:
+        df["subcat_reason"] = ""
+
+    idx = df.index[mask][0]
+    df.at[idx, "mfg_subcategory"] = normalized
+    df.at[idx, "subcat_confidence"] = "manual" if normalized else ""
+    df.at[idx, "subcat_reason"] = "manual review edit" if normalized else ""
+    store.write_csv("capex_clean.csv", _csv_safe(df))
+    return _csv_safe(df.loc[[idx]]).to_dict(orient="records")[0]
+
+
+def _delete_manual_po(line_id: str) -> bool:
+    line_id = _to_str(line_id)
+    if not line_id:
+        return False
+    df = _load_data()
+    if df.empty or "line_id" not in df.columns or "source" not in df.columns:
+        return False
+
+    mask = (df["line_id"].astype(str) == line_id) & (df["source"].astype(str) == "manual")
+    if not bool(mask.any()):
+        return False
+
+    df = df.loc[~mask].copy()
+    store.write_csv("capex_clean.csv", _csv_safe(df))
+
+    overrides = _load_overrides()
+    if line_id in overrides:
+        overrides.pop(line_id, None)
+        _save_overrides(overrides)
+    return True
+
+
+def _list_manual_po_rows() -> list[dict[str, Any]]:
+    df = _load_data()
+    if df.empty or "source" not in df.columns:
+        return []
+    manual_df = df[df["source"].astype(str) == "manual"].copy()
+    if manual_df.empty:
+        return []
+    if "date_order" in manual_df.columns:
+        manual_df = manual_df.sort_values(["date_order", "po_number"], ascending=[False, True], na_position="last")
+    return _csv_safe(manual_df).to_dict(orient="records")
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +441,7 @@ select:focus{border-color:var(--green)}
 .source-badge{display:inline-block;padding:1px 6px;border-radius:3px;font-size:9px;font-weight:700;text-transform:uppercase;margin-right:4px}
 .source-badge.odoo{background:rgba(178,221,121,.12);color:var(--green)}
 .source-badge.ramp{background:rgba(4,142,229,.12);color:var(--blue)}
+.source-badge.manual{background:rgba(247,195,60,.15);color:var(--yellow)}
 table.dataTable{color:var(--text)!important;background:var(--surface)!important;border-collapse:collapse!important;width:100%!important;font-size:12px!important;table-layout:auto!important}
 table.dataTable thead th{background:var(--surface2)!important;color:var(--muted)!important;border-bottom:1px solid var(--border)!important;font-size:11px!important;padding:8px 6px!important;text-transform:uppercase;letter-spacing:.3px;font-weight:600;overflow:hidden;min-width:50px}
 table.dataTable tbody td{border-bottom:1px solid rgba(62,61,58,.4)!important;padding:6px!important;vertical-align:middle;max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -146,6 +468,22 @@ dt.buttons-csv{background:var(--green)!important;color:var(--accent-dark)!import
 .col-resizer{position:absolute;top:0;right:0;width:14px;height:100%;cursor:col-resize;z-index:3;touch-action:none}
 .col-resizer:hover{background:rgba(178,221,121,.18)}
 body.col-resize-active{cursor:col-resize;user-select:none}
+.manual-wrap{padding:24px;max-width:1400px;margin:0 auto}
+.manual-grid{display:grid;grid-template-columns:repeat(4,minmax(180px,1fr));gap:10px}
+.manual-field{display:flex;flex-direction:column;gap:6px}
+.manual-field label{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.8px}
+.manual-field input,.manual-field textarea,.manual-field select{background:var(--surface2);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:8px 10px;font-size:12px;outline:none}
+.manual-field textarea{min-height:64px;resize:vertical}
+.manual-field input:focus,.manual-field textarea:focus,.manual-field select:focus{border-color:var(--green)}
+.manual-actions{display:flex;gap:8px;margin-top:12px}
+.manual-btn{padding:8px 14px;border:none;border-radius:6px;cursor:pointer;font-size:12px;font-weight:700}
+.manual-btn.save{background:var(--green);color:var(--accent-dark)}
+.manual-btn.clear{background:var(--surface2);color:var(--text)}
+.manual-list{margin-top:16px;background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:auto}
+.manual-table{width:100%;border-collapse:collapse;font-size:12px}
+.manual-table th{background:var(--surface2);color:var(--muted);padding:8px 10px;text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:.4px}
+.manual-table td{padding:8px 10px;border-top:1px solid rgba(62,61,58,.4);white-space:nowrap}
+.manual-tag{font-size:10px;color:var(--green);font-weight:700}
 </style>
 </head>
 <body>
@@ -160,6 +498,7 @@ body.col-resize-active{cursor:col-resize;user-select:none}
     <div class="tab" data-tab="agent_proposals" onclick="switchTab(this)">Agent Proposals <span class="badge" id="badge-agent_proposals">0</span></div>
     <div class="tab" data-tab="verified" onclick="switchTab(this)">Verified <span class="badge" id="badge-verified">0</span></div>
     <div class="tab" data-tab="table_view" onclick="switchTab(this)">Table View <span class="badge" id="badge-table_view">All</span></div>
+    <div class="tab" data-tab="manual_po" onclick="switchTab(this)">Manual PO Entry</div>
     <div class="filter-sep"></div>
     <select class="station-filter" id="stationFilter" onchange="render()">
         <option value="">All Stations / Assignments</option>
@@ -168,6 +507,7 @@ body.col-resize-active{cursor:col-resize;user-select:none}
         <option value="">All Sources</option>
         <option value="odoo">Odoo PO</option>
         <option value="ramp">Ramp CC</option>
+        <option value="manual">Manual PO</option>
     </select>
 </div>
 
@@ -182,23 +522,107 @@ body.col-resize-active{cursor:col-resize;user-select:none}
     <div id="tbl-container"></div>
 </div>
 
+<div id="manualPoWrap" style="display:none">
+    <div class="manual-wrap">
+        <div class="stats" id="manual-stats" style="padding:0 0 12px"></div>
+        <div class="po-group" style="padding:16px">
+            <div class="manual-grid">
+                <div class="manual-field"><label>PO Number *</label><input id="m-po-number" type="text" placeholder="PO-XXXX"></div>
+                <div class="manual-field"><label>Date *</label><input id="m-date-order" type="date"></div>
+                <div class="manual-field"><label>Vendor *</label><input id="m-vendor-name" type="text" placeholder="Vendor name"></div>
+                <div class="manual-field"><label>Subtotal (USD) *</label><input id="m-price-subtotal" type="number" step="0.01" min="0" placeholder="0.00"></div>
+                <div class="manual-field"><label>Project</label><select id="m-project-name"></select></div>
+                <div class="manual-field"><label>Station</label><select id="m-station-id"></select></div>
+                <div class="manual-field"><label>Mapping Status</label><select id="m-mapping-status"><option value="confirmed">confirmed</option><option value="non_prod">non_prod</option><option value="pilot_npi">pilot_npi</option><option value="skip">skip</option></select></div>
+                <div class="manual-field"><label>Category</label><input id="m-product-category" type="text" placeholder="Product category"></div>
+                <div class="manual-field"><label>Sub-Category</label><select id="m-mfg-subcategory"></select></div>
+                <div class="manual-field" style="grid-column:1 / span 4"><label>Item Description *</label><textarea id="m-item-description" placeholder="Description"></textarea></div>
+                <div class="manual-field" style="grid-column:1 / span 4"><label>Notes</label><textarea id="m-po-notes" placeholder="Optional notes"></textarea></div>
+            </div>
+            <input id="m-line-id" type="hidden">
+            <div class="manual-actions">
+                <button class="manual-btn save" onclick="saveManualPO()">Save Manual PO</button>
+                <button class="manual-btn clear" onclick="clearManualForm()">Clear</button>
+                <span class="manual-tag" id="manual-edit-tag"></span>
+            </div>
+        </div>
+        <div class="manual-list">
+            <table class="manual-table">
+                <thead><tr><th>PO</th><th>Date</th><th>Vendor</th><th>Description</th><th>Subtotal</th><th>Project</th><th>Station</th><th>Sub-Category</th><th>Status</th><th>Actions</th></tr></thead>
+                <tbody id="manual-list-body"></tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
 <div class="toast" id="toast">Saved!</div>
 
 <script>
-let DATA=[],STATIONS=[],OVERRIDES={},currentTab='needs_review',tblDT=null;
+let DATA=[],STATIONS=[],OVERRIDES={},currentTab='needs_review',tblDT=null,projValues={},stationValues={},MANUAL_ROWS=[];
+const MFG_PROJECT_CODES=[
+    {id:'BF1-NPI & Pilot Equipment',label:'BF1-NPI & Pilot Equipment'},
+    {id:'BF1-Prototype R&D Lines',label:'BF1-Prototype R&D Lines'},
+    {id:'BF1-Quality Equipment',label:'BF1-Quality Equipment'},
+    {id:'BF1-Facilities and Infrastructure',label:'BF1-Facilities and Infrastructure'},
+    {id:'BF1-Manufacturing IT Systems',label:'BF1-Manufacturing IT Systems'},
+    {id:'BF1-Warehousing and Material Handling',label:'BF1-Warehousing and Material Handling'},
+    {id:'BF1-Maintenance and Spares',label:'BF1-Maintenance and Spares'},
+    {id:'BF1-Module Line 1',label:'BF1-Module Line 1'},
+    {id:'BF1-Module Line 2',label:'BF1-Module Line 2'},
+    {id:'BF1-Inverter Line 1',label:'BF1-Inverter Line 1'},
+    {id:'BF1-Other Allocation',label:'BF1-Other Allocation'},
+];
+const MFG_SUBCATEGORY_OPTIONS=[
+    'Process Equipment',
+    'Controls & Electrical',
+    'Mechanical & Structural',
+    'Consumables',
+    'MFG Tools & Shop Supplies',
+    'Design & Engineering Services',
+    'Integration & Commissioning',
+    'Quality & Metrology',
+    'Software & Licenses',
+    'Shipping & Freight',
+    'Facilities & Office',
+    'IT Equipment',
+    'General & Administrative',
+];
 
 function fmt$(v){if(v==null||isNaN(v))return'$0';const a=Math.abs(v),s=v<0?'-':'';return s+'$'+a.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}
 function fmtShort$(v){if(v==null||isNaN(v))return'$0';const a=Math.abs(v),s=v<0?'-':'';if(a>=1e6)return s+'$'+(a/1e6).toFixed(2)+'M';if(a>=1e3)return s+'$'+(a/1e3).toFixed(1)+'K';return s+'$'+a.toFixed(0)}
+function normalizeProjectName(v){
+    if(v==null)return'';
+    const s=String(v);
+    if(!s||s.toLowerCase()==='nan'||s.toLowerCase()==='null'||s.toLowerCase()==='undefined')return'';
+    return s;
+}
+function ensureSelectOption(sel,val){
+    if(!sel)return;
+    const safeVal=normalizeProjectName(val);
+    if(!safeVal)return;
+    const exists=[...sel.options].some(o=>o.value===safeVal);
+    if(exists)return;
+    const opt=document.createElement('option');
+    opt.value=safeVal;
+    opt.textContent=safeVal;
+    sel.insertBefore(opt,sel.children[1]||null);
+}
+function subcatOptionsHtml(selected){
+    const current=normalizeProjectName(selected);
+    return '<option value="">--</option>'+MFG_SUBCATEGORY_OPTIONS.map(sc=>`<option value="${sc}" ${sc===current?'selected':''}>${sc}</option>`).join('');
+}
 
 async function init(){
     const [dataRes,stationsRes,overridesRes]=await Promise.all([fetch('/api/data'),fetch('/api/stations'),fetch('/api/overrides')]);
     DATA=await dataRes.json();STATIONS=await stationsRes.json();OVERRIDES=await overridesRes.json();
     buildStationFilter();
+    initManualFormOptions();
     render();
 }
 
 function buildStationFilter(){
     const sel=document.getElementById('stationFilter');
+    sel.innerHTML='<option value="">All Stations / Assignments</option>';
     const stations=new Set();
     DATA.forEach(r=>{
         const sid=r.station_id||'';
@@ -217,10 +641,17 @@ function switchTab(el){
     if(currentTab==='table_view'){
         document.querySelector('.content').style.display='none';
         document.getElementById('tableViewWrap').style.display='block';
+        document.getElementById('manualPoWrap').style.display='none';
         loadTableView();
+    } else if(currentTab==='manual_po'){
+        document.querySelector('.content').style.display='none';
+        document.getElementById('tableViewWrap').style.display='none';
+        document.getElementById('manualPoWrap').style.display='block';
+        loadManualPOList();
     } else {
         document.querySelector('.content').style.display='block';
         document.getElementById('tableViewWrap').style.display='none';
+        document.getElementById('manualPoWrap').style.display='none';
         render();
     }
 }
@@ -275,19 +706,7 @@ function render(){
 
     if(!sortedPOs.length){document.getElementById('poGroups').innerHTML='<div class="empty-state">No items match current filters.</div>';return;}
 
-    const PROJECT_CODES=[
-        {id:'BF1-NPI & Pilot Equipment',label:'Pilot Line / NPI'},
-        {id:'BF1-Prototype R&D Lines',label:'Prototype R&D Lines'},
-        {id:'BF1-Quality Equipment',label:'Quality Equipment'},
-        {id:'BF1-Facilities and Infrastructure',label:'Facilities & Infrastructure'},
-        {id:'BF1-Manufacturing IT Systems',label:'Manufacturing IT Systems'},
-        {id:'BF1-Warehousing and Material Handling',label:'Warehousing & Material Handling'},
-        {id:'BF1-Maintenance and Spares',label:'Maintenance & Spares'},
-        {id:'BF1-Module Line 1',label:'Module Line 1 (general)'},
-        {id:'BF1-Module Line 2',label:'Module Line 2 (general)'},
-        {id:'BF1-Inverter Line 1',label:'Inverter Line 1 (general)'},
-    ];
-    const projOpts=PROJECT_CODES.map(p=>`<option value="${p.id}">${p.label}</option>`).join('');
+    const projOpts=MFG_PROJECT_CODES.map(p=>`<option value="${p.id}">${p.label}</option>`).join('');
     const stOpts='<optgroup label="Project Codes">'+projOpts+'</optgroup><optgroup label="BF1 Stations">'+STATIONS.map(s=>`<option value="${s.station_id}">${s.station_id} - ${s.process_name||''}</option>`).join('')+'</optgroup>';
 
     let html='';
@@ -355,8 +774,9 @@ async function savePOOverride(po,status){
         const row=DATA.find(r=>String(r.line_id)===String(lid));
         const finalStation=poStationId||(row?(row.station_id||''):'');
         const stationMeta=STATIONS.find(s=>s.station_id===finalStation);
-        OVERRIDES[String(lid)]={station_id:finalStation,status:status};
-        overridesToSend.push({line_id:lid,station_id:finalStation,status:status});
+        const existPOOv=OVERRIDES[String(lid)]||{};
+        OVERRIDES[String(lid)]={station_id:finalStation,status:status,project_name:existPOOv.project_name||''};
+        overridesToSend.push({line_id:lid,station_id:finalStation,status:status,project_name:existPOOv.project_name||''});
         if(row){row.station_id=finalStation;if(stationMeta)row.station_name=stationMeta.process_name||'';row.mapping_confidence='confirmed';row.mapping_status=status;row.mapping_reason='human override (PO-level): '+status;}
     }
 
@@ -372,7 +792,8 @@ async function saveOverride(lid,status){
     const row=DATA.find(r=>String(r.line_id)===String(lid));
     const stationId=dropdownVal||(row?(row.station_id||''):'');
 
-    OVERRIDES[String(lid)]={station_id:stationId,status:status};
+    const existLineOv=OVERRIDES[String(lid)]||{};
+    OVERRIDES[String(lid)]={station_id:stationId,status:status,project_name:existLineOv.project_name||''};
     const stationMeta=STATIONS.find(s=>s.station_id===stationId);
     if(row){row.station_id=stationId;if(stationMeta)row.station_name=stationMeta.process_name||'';row.mapping_confidence='confirmed';row.mapping_status=status;row.mapping_reason='human override: '+status;}
 
@@ -403,20 +824,19 @@ function loadTableView(){
         <div class="stat-card" style="display:inline-block;margin-right:12px"><div class="label">Total Spend</div><div class="value">${fmtShort$(totalSpend)}</div></div>
         <div class="stat-card" style="display:inline-block"><div class="label">Overrides</div><div class="value">${Object.keys(OVERRIDES).length}</div></div>`;
 
-    const projCodes=[
-        {id:'BF1-NPI & Pilot Equipment',label:'Pilot/NPI'},
-        {id:'BF1-Prototype R&D Lines',label:'R&D Lines'},
-        {id:'BF1-Quality Equipment',label:'Quality'},
-        {id:'BF1-Facilities and Infrastructure',label:'Facilities'},
-        {id:'BF1-Manufacturing IT Systems',label:'Mfg IT'},
-        {id:'BF1-Warehousing and Material Handling',label:'Warehouse'},
-        {id:'BF1-Maintenance and Spares',label:'Maint/Spares'},
-    ];
-    const pOpts=projCodes.map(p=>'<option value="'+p.id+'">'+p.label+'</option>').join('');
+    const pOpts=MFG_PROJECT_CODES.map(p=>'<option value="'+p.id+'">'+p.label+'</option>').join('');
     const sOpts=STATIONS.map(s=>'<option value="'+s.station_id+'">'+s.station_id+'</option>').join('');
     const allOpts='<option value="">--</option><optgroup label="Projects">'+pOpts+'</optgroup><optgroup label="Stations">'+sOpts+'</optgroup>';
+    const projDropOpts='<option value="">--</option>'+pOpts;
 
-    let html='<table id="review-tbl" class="display compact" style="width:100%"><thead><tr><th>Source</th><th>PO</th><th>Date</th><th>Vendor</th><th>Description</th><th>Project</th><th>Subtotal</th><th>Station</th><th>Confidence</th><th>Status</th><th>Assign</th><th>Action</th></tr></thead><tfoot><tr><th></th><th></th><th></th><th></th><th></th><th></th><th></th><th></th><th></th><th></th><th></th><th></th></tr></tfoot><tbody>';
+    projValues={};stationValues={};
+    allSpend.forEach(r=>{
+        const lid=r.line_id||'';const ov=getOverride(lid);
+        projValues[lid]=normalizeProjectName((ov&&ov.project_name)?ov.project_name:(r.project_name||''));
+        stationValues[lid]=(ov&&ov.station_id)?ov.station_id:(r.station_id||'');
+    });
+
+    let html='<table id="review-tbl" class="display compact" style="width:100%"><thead><tr><th>Source</th><th>PO</th><th>Date</th><th>Vendor</th><th>Description</th><th>Project</th><th>Sub-Category</th><th>Subtotal</th><th>Station</th><th>Confidence</th><th>Status</th><th>Assign</th><th>Action</th></tr></thead><tfoot><tr><th></th><th></th><th></th><th></th><th></th><th></th><th></th><th></th><th></th><th></th><th></th><th></th><th></th></tr></tfoot><tbody>';
     allSpend.forEach(r=>{
         const lid=r.line_id||'';
         const ov=getOverride(lid);
@@ -429,21 +849,52 @@ function loadTableView(){
         html+=`<td>${r.date_order||''}</td>`;
         html+=`<td>${r.vendor_name||''}</td>`;
         html+=`<td style="max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${(r.item_description||'').replace(/"/g,'&quot;')}">${r.item_description||''}</td>`;
-        html+=`<td>${r.project_name||''}</td>`;
+        html+=`<td><select class="tbl-select tbl-project" data-lid="${lid}">${projDropOpts}</select></td>`;
+        if((r.source||'')==='manual'){
+            html+=`<td><select class="tbl-select tbl-subcat-manual" data-lid="${lid}">${subcatOptionsHtml(r.mfg_subcategory||'')}</select></td>`;
+        }else{
+            html+=`<td>${escHtml(r.mfg_subcategory||'')}</td>`;
+        }
         html+=`<td style="font-variant-numeric:tabular-nums">${fmt$(sub)}</td>`;
         html+=`<td>${curStation}</td>`;
         html+=`<td><span class="conf-badge conf-${r.mapping_confidence||'none'}">${r.mapping_confidence||'none'}</span></td>`;
         html+=`<td><span class="conf-badge conf-${status}">${status}</span></td>`;
-        html+=`<td><select class="tbl-select" id="tsel-${lid}">${allOpts}</select></td>`;
-        html+=`<td style="white-space:nowrap"><button class="tbl-btn tbl-btn-confirm" onclick="tblSave('${lid}','confirmed')">Confirm</button> <button class="tbl-btn tbl-btn-skip" onclick="tblSave('${lid}','skip')">Skip</button> <button class="tbl-btn" style="background:var(--red);color:#fff" onclick="tblSave('${lid}','non_prod')">Non-P</button> <button class="tbl-btn" style="background:var(--yellow);color:var(--accent-dark)" onclick="tblSave('${lid}','pilot_npi')">Pilot</button> <span class="tbl-saved" id="tok-${lid}">Saved</span></td>`;
+        html+=`<td><select class="tbl-select tbl-assign" data-lid="${lid}">${allOpts}</select></td>`;
+        html+=`<td style="white-space:nowrap"><button class="tbl-btn tbl-btn-confirm" onclick="tblSave(this,'confirmed')">Confirm</button> <button class="tbl-btn tbl-btn-skip" onclick="tblSave(this,'skip')">Skip</button> <button class="tbl-btn" style="background:var(--red);color:#fff" onclick="tblSave(this,'non_prod')">Non-P</button> <button class="tbl-btn" style="background:var(--yellow);color:var(--accent-dark)" onclick="tblSave(this,'pilot_npi')">Pilot</button> <span class="tbl-saved">Saved</span></td>`;
         html+='</tr>';
     });
     html+='</tbody></table>';
     document.getElementById('tbl-container').innerHTML=html;
+    const tblContainer=document.getElementById('tbl-container');
+    tblContainer.onchange=(ev)=>{
+        const target=ev.target;
+        if(target&&target.classList&&target.classList.contains('tbl-project')){
+            tblSaveProject(target);
+            return;
+        }
+        if(target&&target.classList&&target.classList.contains('tbl-subcat-manual')){
+            tblSaveManualSubcat(target);
+        }
+    };
 
     if(tblDT)tblDT.destroy();
     tblDT=$('#review-tbl').DataTable({
-        pageLength:50,order:[[6,'desc']],dom:'Bfrtip',buttons:['csv'],scrollX:true,autoWidth:false,
+        pageLength:50,order:[[7,'desc']],dom:'Bfrtip',buttons:['csv'],scrollX:true,autoWidth:false,deferRender:true,
+        drawCallback:function(){
+            const pageRows=document.querySelectorAll('#review-tbl tbody tr[data-lid]');
+            pageRows.forEach(tr=>{
+                const lid=tr.dataset.lid||'';
+                if(!lid)return;
+                const ps=tr.querySelector('select.tbl-project');
+                if(ps){
+                    const pv=projValues[lid]||'';
+                    ensureSelectOption(ps,pv);
+                    ps.value=pv;
+                }
+                const ss=tr.querySelector('select.tbl-assign');
+                if(ss){ss.value=stationValues[lid]||'';}
+            });
+        },
         initComplete:function(){this.api().columns().every(function(){
             const col=this;const th=$(col.footer());
             if(!th.length)return;
@@ -452,14 +903,6 @@ function loadTableView(){
     });
     enableTableColumnResize(tblDT,'review-tbl');
     tblDT.on('draw.dt',()=>enableTableColumnResize(tblDT,'review-tbl'));
-
-    allSpend.forEach(r=>{
-        const lid=r.line_id||'';
-        const ov=getOverride(lid);
-        const curStation=(ov&&ov.station_id)?ov.station_id:(r.station_id||'');
-        const sel=document.getElementById('tsel-'+lid);
-        if(sel&&curStation)sel.value=curStation;
-    });
 }
 
 function enableTableColumnResize(dt,tableId){
@@ -478,7 +921,7 @@ function enableTableColumnResize(dt,tableId){
     const headCols=[...headTable.querySelectorAll('colgroup col')];
     const bodyCols=[...bodyTable.querySelectorAll('colgroup col')];
     const STORAGE_KEY='review_table_col_widths_v2';
-    const minByCol={0:80,1:90,2:95,3:140,4:260,5:150,6:110,7:130,8:110,9:100,10:170,11:280};
+    const minByCol={0:80,1:90,2:95,3:140,4:260,5:200,6:190,7:110,8:130,9:110,10:100,11:170,12:280};
 
     const applyWidth=(idx,w)=>{
         const width=Math.max(minByCol[idx]||70,Math.round(w));
@@ -543,34 +986,251 @@ function enableTableColumnResize(dt,tableId){
     });
 }
 
-async function tblSave(lid,status){
-    const sel=document.getElementById('tsel-'+lid);
+async function tblSave(btn,status){
+    const tr=btn?btn.closest('tr[data-lid]'):null;
+    const lid=tr?tr.dataset.lid:'';
+    if(!lid)return;
+    const sel=tr.querySelector('select.tbl-assign');
+    const projSel=tr.querySelector('select.tbl-project');
     const dropdownVal=sel?sel.value:'';
+    const projectName=normalizeProjectName(projSel?projSel.value:'');
     const row=DATA.find(r=>String(r.line_id)===String(lid));
     const stationId=dropdownVal||(row?(row.station_id||''):'');
 
-    OVERRIDES[String(lid)]={station_id:stationId,status:status};
+    projValues[lid]=projectName;stationValues[lid]=stationId;
+    OVERRIDES[String(lid)]={station_id:stationId,status:status,project_name:projectName};
     const stationMeta=STATIONS.find(s=>s.station_id===stationId);
-    if(row){row.station_id=stationId;if(stationMeta)row.station_name=stationMeta.process_name||'';row.mapping_confidence='confirmed';row.mapping_status=status;row.mapping_reason='human override: '+status;}
+    if(row){row.station_id=stationId;if(stationMeta)row.station_name=stationMeta.process_name||'';row.mapping_confidence='confirmed';row.mapping_status=status;row.mapping_reason='human override: '+status;if(projectName)row.project_name=projectName;}
 
-    await fetch('/api/override',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({line_id:lid,station_id:stationId,status:status})});
+    await fetch('/api/override',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({line_id:lid,station_id:stationId,status:status,project_name:projectName})});
 
-    const tr=document.querySelector(`tr[data-lid="${lid}"]`);
     if(tr){
         const cells=tr.querySelectorAll('td');
-        if(cells[7])cells[7].textContent=stationId;
-        if(cells[9]){cells[9].innerHTML=`<span class="conf-badge conf-${status}">${status}</span>`;}
+        if(cells[8])cells[8].textContent=stationId;
+        if(cells[10]){cells[10].innerHTML=`<span class="conf-badge conf-${status}">${status}</span>`;}
     }
-    const tok=document.getElementById('tok-'+lid);
+    const tok=tr?tr.querySelector('.tbl-saved'):null;
     if(tok){tok.style.display='inline';setTimeout(()=>{tok.style.display='none';},1500);}
     updateBadges();
     showToast('Saved: '+(stationId||status));
+}
+
+async function tblSaveProject(projSel){
+    const tr=projSel?projSel.closest('tr[data-lid]'):null;
+    const lid=tr?tr.dataset.lid:'';
+    if(!lid)return;
+    const projectName=normalizeProjectName(projSel?projSel.value:'');
+    projValues[lid]=projectName;
+    const row=DATA.find(r=>String(r.line_id)===String(lid));
+    const existing=OVERRIDES[String(lid)]||{};
+    const stationId=existing.station_id||(row?(row.station_id||''):'');
+    const status=existing.status||'confirmed';
+
+    OVERRIDES[String(lid)]={station_id:stationId,status:status,project_name:projectName};
+    if(row)row.project_name=projectName;
+
+    await fetch('/api/override',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({line_id:lid,station_id:stationId,status:status,project_name:projectName})});
+
+    const tok=tr?tr.querySelector('.tbl-saved'):null;
+    if(tok){tok.style.display='inline';setTimeout(()=>{tok.style.display='none';},1500);}
+    updateBadges();
+    showToast('Project updated');
+}
+
+async function tblSaveManualSubcat(subSel){
+    const tr=subSel?subSel.closest('tr[data-lid]'):null;
+    const lid=tr?tr.dataset.lid:'';
+    if(!lid)return;
+    const subcat=normalizeProjectName(subSel.value||'');
+    const res=await fetch('/api/manual_po/'+encodeURIComponent(lid)+'/subcategory',{
+        method:'PUT',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({mfg_subcategory:subcat}),
+    });
+    const out=await res.json();
+    if(!res.ok){
+        showToast(out.error||'Failed updating sub-category');
+        return;
+    }
+    const row=DATA.find(r=>String(r.line_id)===String(lid));
+    if(row)row.mfg_subcategory=subcat;
+    const tok=tr?tr.querySelector('.tbl-saved'):null;
+    if(tok){tok.style.display='inline';setTimeout(()=>{tok.style.display='none';},1500);}
+    showToast('Sub-category updated');
+}
+
+function escHtml(v){
+    return String(v==null?'':v)
+        .replaceAll('&','&amp;')
+        .replaceAll('<','&lt;')
+        .replaceAll('>','&gt;')
+        .replaceAll('"','&quot;')
+        .replaceAll("'",'&#39;');
+}
+
+function initManualFormOptions(){
+    const projSel=document.getElementById('m-project-name');
+    if(projSel){
+        projSel.innerHTML='<option value="">--</option>'+MFG_PROJECT_CODES.map(p=>`<option value="${p.id}">${p.label}</option>`).join('');
+    }
+    const stSel=document.getElementById('m-station-id');
+    if(stSel){
+        stSel.innerHTML='<option value="">--</option>'+STATIONS.map(s=>`<option value="${s.station_id}">${s.station_id} - ${s.process_name||''}</option>`).join('');
+    }
+    const subSel=document.getElementById('m-mfg-subcategory');
+    if(subSel){
+        subSel.innerHTML=subcatOptionsHtml('');
+    }
+    clearManualForm();
+}
+
+async function reloadData(){
+    const [dataRes,overridesRes,stationsRes]=await Promise.all([fetch('/api/data'),fetch('/api/overrides'),fetch('/api/stations')]);
+    DATA=await dataRes.json();
+    OVERRIDES=await overridesRes.json();
+    STATIONS=await stationsRes.json();
+    buildStationFilter();
+    initManualFormOptions();
+}
+
+function clearManualForm(){
+    document.getElementById('m-line-id').value='';
+    document.getElementById('m-po-number').value='';
+    document.getElementById('m-date-order').value='';
+    document.getElementById('m-vendor-name').value='';
+    document.getElementById('m-price-subtotal').value='';
+    document.getElementById('m-project-name').value='';
+    document.getElementById('m-station-id').value='';
+    document.getElementById('m-mapping-status').value='confirmed';
+    document.getElementById('m-product-category').value='';
+    document.getElementById('m-mfg-subcategory').value='';
+    document.getElementById('m-item-description').value='';
+    document.getElementById('m-po-notes').value='';
+    document.getElementById('manual-edit-tag').textContent='';
+}
+
+function updateManualStats(){
+    const rows=DATA.filter(r=>(r.source||'')==='manual'&&(r.line_type||'')==='spend');
+    const totalSpend=rows.reduce((s,r)=>s+(parseFloat(r.price_subtotal)||0),0);
+    document.getElementById('manual-stats').innerHTML=`
+        <div class="stat-card"><div class="label">Manual Lines</div><div class="value">${rows.length.toLocaleString()}</div></div>
+        <div class="stat-card"><div class="label">Manual Spend</div><div class="value">${fmtShort$(totalSpend)}</div></div>
+        <div class="stat-card"><div class="label">Unique POs</div><div class="value">${new Set(rows.map(r=>r.po_number||'')).size}</div></div>`;
+}
+
+async function loadManualPOList(){
+    const res=await fetch('/api/manual_po');
+    MANUAL_ROWS=await res.json();
+    updateManualStats();
+    const body=document.getElementById('manual-list-body');
+    if(!MANUAL_ROWS.length){
+        body.innerHTML='<tr><td colspan="10" style="color:var(--muted)">No manual PO entries yet.</td></tr>';
+        return;
+    }
+    body.innerHTML=MANUAL_ROWS.map(r=>`
+        <tr>
+            <td>${escHtml(r.po_number||'')}</td>
+            <td>${escHtml(r.date_order||'')}</td>
+            <td>${escHtml(r.vendor_name||'')}</td>
+            <td title="${escHtml(r.item_description||'')}">${escHtml(r.item_description||'')}</td>
+            <td>${fmt$(parseFloat(r.price_subtotal||0))}</td>
+            <td>${escHtml(r.project_name||'')}</td>
+            <td>${escHtml(r.station_id||'')}</td>
+            <td>${escHtml(r.mfg_subcategory||'')}</td>
+            <td>${escHtml(r.mapping_status||'')}</td>
+            <td>
+                <button class="tbl-btn tbl-btn-confirm" data-lid="${escHtml(r.line_id||'')}" onclick="editManualPO(this.dataset.lid)">Edit</button>
+                <button class="tbl-btn" style="background:var(--red);color:#fff" data-lid="${escHtml(r.line_id||'')}" onclick="deleteManualPO(this.dataset.lid)">Delete</button>
+            </td>
+        </tr>`).join('');
+}
+
+function editManualPO(lineId){
+    const row=MANUAL_ROWS.find(r=>String(r.line_id)===String(lineId));
+    if(!row)return;
+    document.getElementById('m-line-id').value=row.line_id||'';
+    document.getElementById('m-po-number').value=row.po_number||'';
+    document.getElementById('m-date-order').value=row.date_order||'';
+    document.getElementById('m-vendor-name').value=row.vendor_name||'';
+    document.getElementById('m-price-subtotal').value=row.price_subtotal||'';
+    const projSel=document.getElementById('m-project-name');
+    ensureSelectOption(projSel,row.project_name||'');
+    projSel.value=row.project_name||'';
+    const stSel=document.getElementById('m-station-id');
+    ensureSelectOption(stSel,row.station_id||'');
+    stSel.value=row.station_id||'';
+    document.getElementById('m-mapping-status').value=row.mapping_status||'confirmed';
+    document.getElementById('m-product-category').value=row.product_category||'';
+    const subSel=document.getElementById('m-mfg-subcategory');
+    ensureSelectOption(subSel,row.mfg_subcategory||'');
+    subSel.value=row.mfg_subcategory||'';
+    document.getElementById('m-item-description').value=row.item_description||'';
+    document.getElementById('m-po-notes').value=row.po_notes||'';
+    document.getElementById('manual-edit-tag').textContent='Editing '+(row.line_id||'');
+}
+
+async function saveManualPO(){
+    const lineId=document.getElementById('m-line-id').value||'';
+    const payload={
+        po_number:document.getElementById('m-po-number').value||'',
+        date_order:document.getElementById('m-date-order').value||'',
+        vendor_name:document.getElementById('m-vendor-name').value||'',
+        price_subtotal:document.getElementById('m-price-subtotal').value||'',
+        project_name:document.getElementById('m-project-name').value||'',
+        station_id:document.getElementById('m-station-id').value||'',
+        mapping_status:document.getElementById('m-mapping-status').value||'confirmed',
+        product_category:document.getElementById('m-product-category').value||'',
+        mfg_subcategory:document.getElementById('m-mfg-subcategory').value||'',
+        item_description:document.getElementById('m-item-description').value||'',
+        po_notes:document.getElementById('m-po-notes').value||'',
+    };
+    if(!payload.po_number||!payload.date_order||!payload.vendor_name||!payload.price_subtotal||!payload.item_description){
+        showToast('Fill required fields: PO, Date, Vendor, Description, Subtotal');
+        return;
+    }
+    const isEdit=Boolean(lineId);
+    const url=isEdit?('/api/manual_po/'+encodeURIComponent(lineId)):'/api/manual_po';
+    const method=isEdit?'PUT':'POST';
+    const res=await fetch(url,{method,headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    const out=await res.json();
+    if(!res.ok){
+        const details=out&&out.details?(' - '+out.details.join('; ')):'';
+        showToast((out.error||'Failed saving manual PO')+details);
+        return;
+    }
+    await reloadData();
+    await loadManualPOList();
+    if(currentTab==='table_view')loadTableView();
+    clearManualForm();
+    showToast(isEdit?'Manual PO updated':'Manual PO added');
+}
+
+async function deleteManualPO(lineId){
+    if(!lineId)return;
+    if(!confirm('Delete manual PO entry '+lineId+'?'))return;
+    const res=await fetch('/api/manual_po/'+encodeURIComponent(lineId),{method:'DELETE'});
+    const out=await res.json();
+    if(!res.ok){
+        showToast(out.error||'Failed deleting manual PO');
+        return;
+    }
+    await reloadData();
+    await loadManualPOList();
+    if(currentTab==='table_view')loadTableView();
+    clearManualForm();
+    showToast('Manual PO deleted');
 }
 
 async function reExport(){
     showToast('Re-exporting...');
     const res=await fetch('/api/reexport',{method:'POST'});
     const data=await res.json();
+    if(res.ok){
+        await reloadData();
+        if(currentTab==='table_view')loadTableView();
+        else if(currentTab==='manual_po')await loadManualPOList();
+        else render();
+    }
     showToast(data.message||'Done!');
 }
 
@@ -609,6 +1269,54 @@ def api_overrides():
     return jsonify(_load_overrides())
 
 
+@app.route("/api/manual_po")
+def api_manual_po_list():
+    return jsonify(_list_manual_po_rows())
+
+
+@app.route("/api/manual_po", methods=["POST"])
+def api_manual_po_create():
+    body = request.get_json(silent=True) or {}
+    errors = _validate_manual_payload(body)
+    if errors:
+        return jsonify({"error": "invalid payload", "details": errors}), 400
+    row = _upsert_manual_po(body)
+    return jsonify({"ok": True, "line_id": row["line_id"], "row": row}), 201
+
+
+@app.route("/api/manual_po/<line_id>", methods=["PUT"])
+def api_manual_po_update(line_id: str):
+    body = request.get_json(silent=True) or {}
+    errors = _validate_manual_payload(body)
+    if errors:
+        return jsonify({"error": "invalid payload", "details": errors}), 400
+    try:
+        row = _upsert_manual_po(body, line_id=line_id)
+    except KeyError:
+        return jsonify({"error": "manual row not found"}), 404
+    return jsonify({"ok": True, "line_id": row["line_id"], "row": row})
+
+
+@app.route("/api/manual_po/<line_id>", methods=["DELETE"])
+def api_manual_po_delete(line_id: str):
+    deleted = _delete_manual_po(line_id)
+    if not deleted:
+        return jsonify({"error": "manual row not found"}), 404
+    return jsonify({"ok": True, "line_id": line_id})
+
+
+@app.route("/api/manual_po/<line_id>/subcategory", methods=["PUT"])
+def api_manual_po_subcategory(line_id: str):
+    body = request.get_json(silent=True) or {}
+    try:
+        row = _update_manual_po_subcategory(line_id, body.get("mfg_subcategory", ""))
+    except KeyError:
+        return jsonify({"error": "manual row not found"}), 404
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({"ok": True, "line_id": row.get("line_id", line_id), "row": row})
+
+
 @app.route("/api/override", methods=["POST"])
 def api_save_override():
     body = request.get_json()
@@ -617,10 +1325,12 @@ def api_save_override():
         return jsonify({"error": "line_id required"}), 400
 
     overrides = _load_overrides()
-    overrides[str(lid)] = {
-        "station_id": body.get("station_id", ""),
-        "status": body.get("status", "confirmed"),
-    }
+    existing = overrides.get(str(lid), {})
+    existing["station_id"] = body.get("station_id", "")
+    existing["status"] = body.get("status", "confirmed")
+    if "project_name" in body:
+        existing["project_name"] = body["project_name"]
+    overrides[str(lid)] = existing
     _save_overrides(overrides)
     return jsonify({"ok": True, "total_overrides": len(overrides)})
 
@@ -646,10 +1356,12 @@ def api_save_override_batch():
     for item in items:
         lid = item.get("line_id", "")
         if lid:
-            overrides[str(lid)] = {
-                "station_id": item.get("station_id", ""),
-                "status": item.get("status", "confirmed"),
-            }
+            existing = overrides.get(str(lid), {})
+            existing["station_id"] = item.get("station_id", "")
+            existing["status"] = item.get("status", "confirmed")
+            if "project_name" in item:
+                existing["project_name"] = item["project_name"]
+            overrides[str(lid)] = existing
     _save_overrides(overrides)
     return jsonify({"ok": True, "count": len(items), "total_overrides": len(overrides)})
 

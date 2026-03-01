@@ -109,6 +109,7 @@ def clean_po_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     money_cols = [
         "price_unit", "price_subtotal", "price_tax", "price_total",
         "po_amount_untaxed", "po_amount_tax", "po_amount_total",
+        "bill_amount_total", "bill_amount_paid", "bill_amount_open",
     ]
     for c in money_cols:
         if c in out.columns:
@@ -192,6 +193,7 @@ NON_PROD_PROJECTS: set[str] = {
     "BF1-Warehousing and Material Handling",
     "BF1-Maintenance and Spares",
     "BF1-Prototype R&D Lines",
+    "BF1-Other Allocation",
 }
 
 PILOT_RAMP_CARDS: set[str] = {
@@ -205,6 +207,125 @@ _PAYMENT_TERMS_PATTERN = re.compile(
     r"purchase\s+order\s+is\s+governed|T&Cs?\s+dated)",
     re.IGNORECASE,
 )
+
+_DEPOSIT_PCT_PATTERN = re.compile(
+    r"(\d{1,3})\s*%\s*(deposit|down\s+payment|upon\s+order|at\s+signing|upfront)",
+    re.IGNORECASE,
+)
+_DEPOSIT_AMT_PATTERN = re.compile(
+    r"(deposit|down\s+payment)\s*[\-:]\s*\$?([\d,]+\.?\d*)",
+    re.IGNORECASE,
+)
+_MILESTONE_PCT_PATTERN = re.compile(
+    r"(\d{1,3})\s*%\s*(upon|on|at|after)\s+(delivery|completion|shipment|commissioning|"
+    r"acceptance|installation|FAT|SAT|receipt|final)",
+    re.IGNORECASE,
+)
+
+
+def extract_deposit_info(description: str) -> dict[str, float | str]:
+    """Parse deposit/down-payment percentage and amount from a PO line description.
+
+    Returns a dict with deposit_pct, deposit_amount, and milestone_terms.
+    """
+    result: dict[str, float | str] = {
+        "deposit_pct": 0.0,
+        "deposit_amount": 0.0,
+        "milestone_terms": "",
+    }
+
+    pct_match = _DEPOSIT_PCT_PATTERN.search(description)
+    if pct_match:
+        result["deposit_pct"] = float(pct_match.group(1))
+
+    amt_match = _DEPOSIT_AMT_PATTERN.search(description)
+    if amt_match:
+        result["deposit_amount"] = float(amt_match.group(2).replace(",", ""))
+
+    milestones = _MILESTONE_PCT_PATTERN.findall(description)
+    if milestones:
+        terms = [f"{pct}% {trigger}" for pct, _prep, trigger in milestones]
+        result["milestone_terms"] = "; ".join(terms)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Item bucket classification for the spares catalog
+# ---------------------------------------------------------------------------
+
+_BUCKET_RULES: list[tuple[str, re.Pattern[str]]] = [
+    ("Discount / Credit", re.compile(
+        r"(discount|rebate|credit\s*back)", re.IGNORECASE)),
+    ("Tariff / Surcharge", re.compile(
+        r"(tariff|surcharge|(?<!heavy\s)(?<!medium\s)(?<!light\s)duty\b|"
+        r"duties\b|customs\b)", re.IGNORECASE)),
+    ("Shipping / Logistics", re.compile(
+        r"(^shipping|^freight|^crating|^handling|^DDP\b|ship\s*&\s*handl|"
+        r"shipping\s*(cost|charge|&)|unit\s+shipping|inbound.*shipping|"
+        r"postage|logistics)", re.IGNORECASE)),
+    ("Warranty / Support", re.compile(
+        r"(warranty|support\s+package|tech\s+support|maintenance\s+contract|"
+        r"service\s+agreement|service\s+contract)", re.IGNORECASE)),
+    ("Training", re.compile(
+        r"(training\b)", re.IGNORECASE)),
+    ("Rental / Lease", re.compile(
+        r"(rental|lease\b|monthly\s+rental)", re.IGNORECASE)),
+    ("Permitting / Compliance", re.compile(
+        r"(^permitting|^permit\b|compliance\b|certification\b)", re.IGNORECASE)),
+    ("Services / Labor", re.compile(
+        r"(^labor\b|^line\s+\d+\s+labor|^installation\b|^install\b|"
+        r"on-?site\s+install|commissioning|startup|start-?up|"
+        r"^project\s+management|^engineering\s+hour|concepting\s+hours|"
+        r"process\s+engineering|^consulting|^FAT\b.*\bSAT\b|"
+        r"integration\s+package|controls\s+integration|"
+        r"electrical\s+installation|mechanical.*installation|"
+        r"on-?site\s+fee|calibration\s+service)", re.IGNORECASE)),
+    ("Software", re.compile(
+        r"(^software\b|fleet\s+management\s+software|license\s+key|"
+        r"subscription\b)", re.IGNORECASE)),
+]
+
+_CATEGORY_BUCKET_MAP: dict[str, str] = {
+    "Non-Inventory: R&D Services": "Services / Labor",
+    "Non-Inventory: R&D Shipping & Postage": "Shipping / Logistics",
+    "Non-Inventory: G&A Shipping & Logistics": "Shipping / Logistics",
+    "Non-Inventory: Inbound Production Shipping": "Shipping / Logistics",
+    "Non-Inventory: Software and Applications": "Software",
+}
+
+CAPITAL_EQUIPMENT_THRESHOLD = 50_000.0
+
+
+def classify_item_bucket(
+    description: str,
+    product_category: str,
+    avg_unit_price: float,
+    total_spend: float,
+) -> str:
+    """Classify a spares-catalog row into a spend bucket.
+
+    Priority order: keyword rules on description, then category-based
+    fallback, then price heuristic for capital equipment, then default
+    to 'Parts / Materials'.
+    """
+    desc = str(description).strip()
+    cat = str(product_category).strip()
+
+    if total_spend < 0:
+        return "Discount / Credit"
+
+    for bucket, pattern in _BUCKET_RULES:
+        if pattern.search(desc):
+            return bucket
+
+    if cat in _CATEGORY_BUCKET_MAP:
+        return _CATEGORY_BUCKET_MAP[cat]
+
+    if avg_unit_price >= CAPITAL_EQUIPMENT_THRESHOLD:
+        return "Capital Equipment"
+
+    return "Parts / Materials"
 
 PROJECT_TO_LINE_PREFIX: dict[str, list[str]] = {
     "BF1-Module Line 1": ["BASE1-MOD1", "BASE1-CELL1"],
@@ -352,29 +473,54 @@ def merge_section_headers(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def classify_line_type(df: pd.DataFrame) -> pd.DataFrame:
-    """Tag each row with a line_type: spend, section_header, payment_terms, misc."""
+    """Tag each row with a line_type: spend, section_header, payment_terms, misc.
+
+    For payment_terms lines, also extracts deposit percentage, amount, and milestone terms.
+    """
     out = df.copy()
     types: list[str] = []
+    deposit_pcts: list[float] = []
+    deposit_amts: list[float] = []
+    milestone_terms: list[str] = []
 
     for _, row in out.iterrows():
         source = row.get("source", "odoo")
         qty = row.get("product_qty", 0)
-        desc = str(row.get("line_description", ""))
+        desc = str(row.get("line_description", row.get("item_description", "")))
 
         if source == "ramp":
             types.append("spend")
+            deposit_pcts.append(0.0)
+            deposit_amts.append(0.0)
+            milestone_terms.append("")
             continue
 
         if qty != 0:
             types.append("spend")
+            deposit_pcts.append(0.0)
+            deposit_amts.append(0.0)
+            milestone_terms.append("")
         elif _PAYMENT_TERMS_PATTERN.search(desc):
             types.append("payment_terms")
+            info = extract_deposit_info(desc)
+            deposit_pcts.append(float(info["deposit_pct"]))
+            deposit_amts.append(float(info["deposit_amount"]))
+            milestone_terms.append(str(info["milestone_terms"]))
         elif qty == 0:
             types.append("section_header")
+            deposit_pcts.append(0.0)
+            deposit_amts.append(0.0)
+            milestone_terms.append("")
         else:
             types.append("misc")
+            deposit_pcts.append(0.0)
+            deposit_amts.append(0.0)
+            milestone_terms.append("")
 
     out["line_type"] = types
+    out["deposit_pct"] = deposit_pcts
+    out["deposit_amount"] = deposit_amts
+    out["milestone_terms"] = milestone_terms
     return out
 
 
@@ -392,6 +538,90 @@ def tag_capex_flag(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 # Ramp Normalization
 # ---------------------------------------------------------------------------
+
+def load_and_normalize_ramp_from_odoo(
+    df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Normalize Ramp data pulled from Odoo account_move tables into the PO schema.
+
+    Data is pre-filtered by project codes in the SQL query, so no additional
+    filtering is needed here. Vendor names ending with "(Merchant)" are cleaned
+    to extract the actual merchant name.
+
+    Args:
+        df: Raw DataFrame from ramp_from_odoo.sql query (already filtered by project codes).
+    """
+    import hashlib
+
+    if df.empty:
+        return pd.DataFrame()
+
+    df = df.copy()
+    n = len(df)
+    is_merchant = df["vendor_name"].fillna("").str.contains(r"\(Merchant\)", regex=True)
+
+    card_holder = df["vendor_name"].copy()
+    merchant_name = df["vendor_name"].copy()
+    card_holder[is_merchant] = ""
+    merchant_name[~is_merchant] = ""
+    merchant_name = merchant_name.str.replace(r"\s*\(Merchant\)\s*", "", regex=True)
+
+    def _stable_id(row: pd.Series, prefix: str) -> str:
+        key = f"{row.get('ramp_external_id', '')}|{row.get('line_id', '')}|{row.get('invoice_date', '')}"
+        return prefix + hashlib.md5(key.encode()).hexdigest()[:8]
+
+    out = pd.DataFrame(index=range(n))
+    out["source"] = "ramp"
+    out["po_number"] = [_stable_id(df.iloc[i], "RAMP-") for i in range(n)]
+    out["date_order"] = pd.to_datetime(df["invoice_date"].values, errors="coerce").strftime("%Y-%m-%d")
+    out["po_state"] = "purchase"
+    out["po_invoice_status"] = ""
+    out["po_receipt_status"] = ""
+
+    out["vendor_name"] = merchant_name.where(is_merchant, df["vendor_name"]).values
+    out["vendor_ref"] = ""
+    out["created_by_name"] = card_holder.values
+
+    desc = df["line_description"].fillna("").astype(str)
+    ref = df["line_ref"].fillna("").astype(str)
+    memo = df["move_ref"].fillna("").astype(str)
+    best_desc = desc.where(desc != "", ref).where(desc != "", memo)
+
+    out["line_description"] = best_desc.values
+    out["item_description"] = best_desc.values
+    out["product_category"] = ""
+
+    out["product_id"] = df["product_id"].fillna("").astype(str).values
+    out["product_qty"] = pd.to_numeric(df["product_qty"], errors="coerce").fillna(1).values
+    out["qty_received"] = out["product_qty"].values
+    out["product_uom"] = ""
+    out["price_unit"] = pd.to_numeric(df["price_unit"], errors="coerce").fillna(0).values
+    out["price_subtotal"] = pd.to_numeric(df["price_subtotal"], errors="coerce").fillna(0).values
+    out["price_tax"] = 0.0
+    out["price_total"] = pd.to_numeric(df["price_total"], errors="coerce").fillna(0).values
+    out["line_date_planned"] = ""
+    out["line_sequence"] = ""
+    out["line_id"] = [_stable_id(df.iloc[i], "RL-") for i in range(n)]
+
+    proj = df["project_name"].fillna("").astype(str)
+    proj = proj.apply(_extract_en_us_name)
+    proj = proj.str.replace(" - Base Power, Inc.", "", regex=False).str.strip()
+    out["project_name"] = proj.values
+
+    out["po_amount_total"] = pd.to_numeric(df["bill_amount_total"], errors="coerce").fillna(0).values
+    out["bill_count"] = 1
+    out["bill_amount_total"] = out["po_amount_total"].values
+    out["bill_amount_paid"] = pd.to_numeric(df["bill_amount_paid"], errors="coerce").fillna(0).values
+    out["bill_amount_open"] = pd.to_numeric(df["bill_amount_open"], errors="coerce").fillna(0).values
+    out["bill_payment_status"] = df["payment_state"].fillna("").values
+    out["po_notes"] = memo.values
+    out["ramp_external_id"] = df["ramp_external_id"].fillna("").values
+
+    for alias_from, alias_to in RAMP_USER_ALIASES.items():
+        out["created_by_name"] = out["created_by_name"].replace(alias_from, alias_to)
+
+    return out
+
 
 def load_and_normalize_ramp(csv_path: str | Path) -> pd.DataFrame:
     """Load Ramp CSV, filter to CAPEX+materials categories, reshape to Odoo schema."""
@@ -415,6 +645,8 @@ def load_and_normalize_ramp(csv_path: str | Path) -> pd.DataFrame:
         ramp["Transaction Date"].values, format="%m/%d/%y"
     ).strftime("%Y-%m-%d")
     out["po_state"] = "purchase"
+    out["po_invoice_status"] = ""
+    out["po_receipt_status"] = ""
     out["vendor_name"] = ramp["Merchant Name"].values
     out["vendor_ref"] = ""
     out["line_description"] = ramp["Merchant Name"].values
@@ -442,6 +674,11 @@ def load_and_normalize_ramp(csv_path: str | Path) -> pd.DataFrame:
     out["created_by_name"] = user.values
 
     out["po_amount_total"] = ramp["Amount"].values
+    out["bill_count"] = 0
+    out["bill_amount_total"] = 0.0
+    out["bill_amount_paid"] = 0.0
+    out["bill_amount_open"] = 0.0
+    out["bill_payment_status"] = ""
     out["po_notes"] = ""
     out["is_capex"] = out["product_category"].isin(CAPEX_CATEGORIES)
 
@@ -591,6 +828,12 @@ def _pick_best_station(
     return best_id, station_name_map.get(best_id, ""), best_score
 
 
+def _project_allows_base2(project_name: str) -> bool:
+    """Only allow BASE2 station assignment when project explicitly indicates BASE2/BF2."""
+    p = str(project_name).upper()
+    return ("BASE2" in p) or ("BF2" in p) or ("CIP-BF2-" in p)
+
+
 def auto_map_stations(
     df: pd.DataFrame,
     stations: list[dict],
@@ -610,11 +853,25 @@ def auto_map_stations(
     for _, row in out.iterrows():
         proj = str(row.get("project_name", "")).strip()
         vendor = str(row.get("vendor_name", "")).strip()
+        creator = str(row.get("created_by_name", "")).strip()
         desc = str(row.get("item_description", "")).strip()
         line_desc = str(row.get("line_description", "")).strip()
         source = row.get("source", "odoo")
         line_type = row.get("line_type", "spend")
         ramp_card = str(row.get("ramp_card", "")).strip()
+        date_order = pd.to_datetime(row.get("date_order", ""), errors="coerce")
+        if proj.lower() == "nan":
+            proj = ""
+        if vendor.lower() == "nan":
+            vendor = ""
+        if creator.lower() == "nan":
+            creator = ""
+        if desc.lower() == "nan":
+            desc = ""
+        if line_desc.lower() == "nan":
+            line_desc = ""
+        if ramp_card.lower() == "nan":
+            ramp_card = ""
 
         if line_type != "spend":
             result_station_id.append("")
@@ -637,6 +894,27 @@ def auto_map_stations(
             result_station_name.append("")
             result_confidence.append("medium")
             result_reason.append(f"pilot_npi: ramp card='{ramp_card}'")
+            continue
+
+        # --- Tier 3b: Ramp routing when project context is missing ---
+        # This prevents persistent "unmapped" buckets for operational card spend.
+        if source == "ramp" and not proj:
+            if creator in {"Christopher George", "Kelsea Allenbaugh"}:
+                result_station_id.append("BF1-Facilities and Infrastructure")
+                result_station_name.append("BF1-Facilities and Infrastructure")
+                result_confidence.append("high")
+                result_reason.append(f"non_prod: ramp creator={creator}")
+                continue
+            if pd.notna(date_order) and date_order < pd.Timestamp("2025-11-01"):
+                result_station_id.append("BF1-NPI & Pilot Equipment")
+                result_station_name.append("BF1-NPI & Pilot Equipment")
+                result_confidence.append("medium")
+                result_reason.append("pilot_npi: ramp pre-2025-11-01")
+                continue
+            result_station_id.append("BF1-Other Allocation")
+            result_station_name.append("BF1-Other Allocation")
+            result_confidence.append("low")
+            result_reason.append("non_prod: ramp no project -> other allocation")
             continue
 
         # --- Tier 1: Direct CIP project mapping ---
@@ -669,6 +947,16 @@ def auto_map_stations(
         candidates: dict[str, int] = {}
 
         vendor_stations = _fuzzy_vendor_match(vendor, vendor_lookup)
+        # Guardrail: if project maps to a production line, vendor matches must stay
+        # within that line family; otherwise high vendor score can mis-route to BASE2.
+        if line_prefixes:
+            vendor_stations = [
+                sid for sid in vendor_stations
+                if any(sid.startswith(pfx) for pfx in line_prefixes)
+            ]
+        # Guardrail: BASE2 assignments require explicit project intent.
+        if not _project_allows_base2(proj):
+            vendor_stations = [sid for sid in vendor_stations if not sid.startswith("BASE2-")]
         for sid in vendor_stations:
             candidates[sid] = candidates.get(sid, 0) + 3
 
@@ -678,6 +966,8 @@ def auto_map_stations(
                     if sid.startswith(pfx):
                         candidates[sid] = candidates.get(sid, 0) + 2
                         break
+        if not _project_allows_base2(proj):
+            candidates = {sid: sc for sid, sc in candidates.items() if not sid.startswith("BASE2-")}
 
         search_text = f"{desc} {line_desc}".lower()
         kw_matches = _keyword_station_match(search_text)
@@ -775,7 +1065,7 @@ def apply_overrides(
         "BF1-NPI & Pilot Equipment", "BF1-Prototype R&D Lines",
         "BF1-Quality Equipment", "BF1-Facilities and Infrastructure",
         "BF1-Manufacturing IT Systems", "BF1-Warehousing and Material Handling",
-        "BF1-Maintenance and Spares", "BF1-Module Line 1",
+        "BF1-Maintenance and Spares", "BF1-Other Allocation", "BF1-Module Line 1",
         "BF1-Module Line 2", "BF1-Inverter Line 1",
     }
     out = df.copy()

@@ -7,6 +7,8 @@ Skipped entirely when GOOGLE_CLIENT_ID env var is not set (local dev).
 from __future__ import annotations
 
 import os
+import secrets
+import time
 from urllib.parse import urlencode
 
 import requests as http_requests
@@ -16,10 +18,13 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 ALLOWED_DOMAIN = "basepowercompany.com"
+AUTH_DEBUG = os.environ.get("AUTH_DEBUG", "").strip().lower() in {"1", "true", "yes", "y"}
 
 GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v3/userinfo"
+SHEETS_READ_SCOPE = "https://www.googleapis.com/auth/spreadsheets.readonly"
+OAUTH_SCOPES = ["openid", "email", "profile", SHEETS_READ_SCOPE]
 
 LOGIN_HTML = """
 <!DOCTYPE html>
@@ -85,6 +90,48 @@ def _auth_enabled() -> bool:
     return bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET)
 
 
+def _refresh_google_access_token(refresh_token: str) -> str | None:
+    """Refresh user access token using stored Google refresh token."""
+    token_resp = http_requests.post(GOOGLE_TOKEN_URL, data={
+        "refresh_token": refresh_token,
+        "client_id": GOOGLE_CLIENT_ID,
+        "client_secret": GOOGLE_CLIENT_SECRET,
+        "grant_type": "refresh_token",
+    }, timeout=10)
+    if token_resp.status_code != 200:
+        return None
+
+    token_data = token_resp.json()
+    access_token = token_data.get("access_token")
+    if not access_token:
+        return None
+
+    expires_in = int(token_data.get("expires_in", 3600) or 3600)
+    session["google_access_token"] = access_token
+    session["google_token_expiry"] = int(time.time()) + max(60, expires_in - 60)
+    new_refresh = token_data.get("refresh_token")
+    if new_refresh:
+        session["google_refresh_token"] = new_refresh
+    return access_token
+
+
+def get_google_access_token() -> str | None:
+    """Get a valid Google user access token from session (refresh if needed)."""
+    if not _auth_enabled():
+        return None
+
+    token = str(session.get("google_access_token", "") or "")
+    expiry = int(session.get("google_token_expiry", 0) or 0)
+    now = int(time.time())
+    if token and expiry > (now + 30):
+        return token
+
+    refresh_token = str(session.get("google_refresh_token", "") or "")
+    if refresh_token:
+        return _refresh_google_access_token(refresh_token)
+    return token or None
+
+
 def init_auth(app: Flask) -> None:
     """Register auth routes and before_request hook on the Flask app."""
     if not _auth_enabled():
@@ -114,35 +161,46 @@ def init_auth(app: Flask) -> None:
             proto = "https"
         return f"{proto}://{host}/auth/callback"
 
-    @app.route("/auth/debug")
-    def auth_debug():
-        """Temporary debug endpoint -- remove after OAuth is working."""
-        return {
-            "request.scheme": request.scheme,
-            "request.host": request.host,
-            "request.url_root": request.url_root,
-            "X-Forwarded-Proto": request.headers.get("X-Forwarded-Proto", "NOT SET"),
-            "X-Forwarded-Host": request.headers.get("X-Forwarded-Host", "NOT SET"),
-            "X-Forwarded-For": request.headers.get("X-Forwarded-For", "NOT SET"),
-            "K_SERVICE": os.environ.get("K_SERVICE", "NOT SET"),
-            "callback_url": _callback_url(),
-        }
+    if AUTH_DEBUG:
+        @app.route("/auth/debug")
+        def auth_debug():
+            """OAuth request debugging endpoint. Enable only with AUTH_DEBUG=true."""
+            return {
+                "request.scheme": request.scheme,
+                "request.host": request.host,
+                "request.url_root": request.url_root,
+                "X-Forwarded-Proto": request.headers.get("X-Forwarded-Proto", "NOT SET"),
+                "X-Forwarded-Host": request.headers.get("X-Forwarded-Host", "NOT SET"),
+                "X-Forwarded-For": request.headers.get("X-Forwarded-For", "NOT SET"),
+                "K_SERVICE": os.environ.get("K_SERVICE", "NOT SET"),
+                "callback_url": _callback_url(),
+            }
 
     @app.route("/auth/login")
     def auth_login():
         callback_url = _callback_url()
+        state = secrets.token_urlsafe(24)
+        session["oauth_state"] = state
         params = {
             "client_id": GOOGLE_CLIENT_ID,
             "redirect_uri": callback_url,
             "response_type": "code",
-            "scope": "openid email profile",
+            "scope": " ".join(OAUTH_SCOPES),
             "hd": ALLOWED_DOMAIN,
-            "prompt": "select_account",
+            "prompt": "consent select_account",
+            "access_type": "offline",
+            "include_granted_scopes": "true",
+            "state": state,
         }
         return redirect(GOOGLE_AUTH_URL + "?" + urlencode(params))
 
     @app.route("/auth/callback")
     def auth_callback():
+        expected_state = str(session.pop("oauth_state", "") or "")
+        incoming_state = str(request.args.get("state", "") or "")
+        if not expected_state or incoming_state != expected_state:
+            return redirect("/auth/login-page?error=Invalid+OAuth+state.+Please+try+again")
+
         code = request.args.get("code")
         if not code:
             return redirect("/auth/login-page?error=No+authorization+code+received")
@@ -159,7 +217,17 @@ def init_auth(app: Flask) -> None:
         if token_resp.status_code != 200:
             return redirect("/auth/login-page?error=Failed+to+exchange+token")
 
-        access_token = token_resp.json().get("access_token")
+        token_data = token_resp.json()
+        access_token = token_data.get("access_token")
+        refresh_token = token_data.get("refresh_token")
+        expires_in = int(token_data.get("expires_in", 3600) or 3600)
+        if not access_token:
+            return redirect("/auth/login-page?error=Failed+to+get+access+token")
+
+        session["google_access_token"] = access_token
+        if refresh_token:
+            session["google_refresh_token"] = refresh_token
+        session["google_token_expiry"] = int(time.time()) + max(60, expires_in - 60)
         user_resp = http_requests.get(
             GOOGLE_USERINFO_URL,
             headers={"Authorization": f"Bearer {access_token}"},

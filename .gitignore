@@ -28,6 +28,7 @@ Ramp/
 
 # Cursor IDE (keep skills/rules, ignore transient project state)
 .cursor/projects/
+.cursor/worktrees.json
 
 # OS artifacts
 Thumbs.db
@@ -38,6 +39,7 @@ Desktop.ini
 *.log
 *.tmp
 *.bak
+bigquery/_tmp_query.sql
 
 # Environment / secrets
 .env
