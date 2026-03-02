@@ -1,21 +1,14 @@
 -- POs created by listed team members, last 7 months. Line-level with vendor, project, key fields.
--- Dataset: gtm-analytics-447201.odoo_public
+-- Dataset: {odoo_source}
 
+-- Creator names are injected from dashboard_settings.json at pipeline runtime.
+-- The {creator_names} placeholder is replaced with a SQL IN-list.
+-- To update: edit the po_creator_names list in Settings or dashboard_settings.json.
 WITH creators AS (
   SELECT u.id AS user_id
-  FROM `gtm-analytics-447201.odoo_public.res_users` u
-  JOIN `gtm-analytics-447201.odoo_public.res_partner` p ON u.partner_id = p.id
-  WHERE LOWER(TRIM(p.name)) IN (
-    'alex mitchell', 'ali nik-ahd', 'amber platt', 'andy ross', 'avi anklesaria',
-    'benjamin munoz', 'brandon dillard', 'brian connellan', 'callum marsh',
-    'chris johnston', 'christopher george', 'christopher vega', 'daleian gopee',
-    'diya nair', 'eduardo martinez v.', 'edward pienkowski', 'emerson walter',
-    'eric martinez', 'evan pickar', 'ezra doron', 'jamie steele mcdonald',
-    'jens emil clausen', 'jimmy kiel', 'juan manrique', 'kelsea allenbaugh',
-    'krupal patel', 'kyle morgan', 'kyle wozniak', 'loren grabowski', 'luis gastelum',
-    'maintenance bot', 'markia darby', 'mike webb', 'rene santos', 'reyes mata',
-    'scott rossi', 'vitor ayres', 'zach patterson', 'zack de la rosa anderson'
-  )
+  FROM `{odoo_source}.res_users` u
+  JOIN `{odoo_source}.res_partner` p ON u.partner_id = p.id
+  WHERE LOWER(TRIM(p.name)) IN ({creator_names})
 ),
 bill_links AS (
   SELECT
@@ -23,10 +16,13 @@ bill_links AS (
     am.id AS bill_id,
     am.payment_state,
     am.state AS bill_state,
+    am.invoice_date AS bill_invoice_date,
+    am.invoice_date_due AS bill_due_date,
+    am.date AS bill_posting_date,
     CAST(am.amount_total_signed AS BIGNUMERIC) AS bill_total_signed,
     CAST(am.amount_residual_signed AS BIGNUMERIC) AS bill_residual_signed
-  FROM `gtm-analytics-447201.odoo_public.account_move_line` aml
-  JOIN `gtm-analytics-447201.odoo_public.account_move` am
+  FROM `{odoo_source}.account_move_line` aml
+  JOIN `{odoo_source}.account_move` am
     ON am.id = aml.move_id
   WHERE aml.purchase_line_id IS NOT NULL
     AND am.move_type IN ('in_invoice', 'in_refund')
@@ -49,6 +45,11 @@ bill_status_by_line AS (
     SUM(ABS(bill_total_signed)) AS bill_amount_total,
     SUM(GREATEST(ABS(bill_total_signed) - ABS(bill_residual_signed), 0)) AS bill_amount_paid,
     SUM(ABS(bill_residual_signed)) AS bill_amount_open,
+    MIN(bill_invoice_date) AS first_bill_date,
+    MAX(bill_invoice_date) AS last_bill_date,
+    MIN(bill_due_date) AS earliest_due_date,
+    MAX(bill_due_date) AS latest_due_date,
+    MIN(bill_posting_date) AS first_posting_date,
     CASE
       WHEN COUNT(*) = 0 THEN 'no_bill'
       WHEN LOGICAL_AND(payment_state = 'paid') THEN 'paid'
@@ -100,17 +101,23 @@ SELECT
   po.notes AS po_notes,
   po.create_date AS po_created_date,
   po.write_date AS po_updated_date,
+  po.payment_term_id,
   bsl.bill_count,
   bsl.bill_amount_total,
   bsl.bill_amount_paid,
   bsl.bill_amount_open,
+  bsl.first_bill_date,
+  bsl.last_bill_date,
+  bsl.earliest_due_date,
+  bsl.latest_due_date,
+  bsl.first_posting_date,
   bsl.bill_payment_status
-FROM `gtm-analytics-447201.odoo_public.purchase_order` po
-JOIN `gtm-analytics-447201.odoo_public.purchase_order_line` pol ON pol.order_id = po.id
-LEFT JOIN `gtm-analytics-447201.odoo_public.res_partner` v ON po.partner_id = v.id
-LEFT JOIN `gtm-analytics-447201.odoo_public.account_analytic_account` aaa ON pol.analytic_account_project_id = aaa.id
-LEFT JOIN `gtm-analytics-447201.odoo_public.res_users` creator_u ON po.create_uid = creator_u.id
-LEFT JOIN `gtm-analytics-447201.odoo_public.res_partner` creator_p ON creator_u.partner_id = creator_p.id
+FROM `{odoo_source}.purchase_order` po
+JOIN `{odoo_source}.purchase_order_line` pol ON pol.order_id = po.id
+LEFT JOIN `{odoo_source}.res_partner` v ON po.partner_id = v.id
+LEFT JOIN `{odoo_source}.account_analytic_account` aaa ON pol.analytic_account_project_id = aaa.id
+LEFT JOIN `{odoo_source}.res_users` creator_u ON po.create_uid = creator_u.id
+LEFT JOIN `{odoo_source}.res_partner` creator_p ON creator_u.partner_id = creator_p.id
 LEFT JOIN bill_status_by_line bsl ON bsl.po_line_id = pol.id
 WHERE po.create_uid IN (SELECT user_id FROM creators)
   AND po.date_order >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 MONTH)

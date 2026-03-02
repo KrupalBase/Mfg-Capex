@@ -7,6 +7,7 @@ Open: http://localhost:5051
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
 from typing import Any
 
@@ -1370,9 +1371,13 @@ def api_save_override_batch():
 def api_reexport():
     import subprocess
     import sys
+    cmd = [sys.executable, str(Path(__file__).resolve().parent / "capex_pipeline.py"), "--skip-bq"]
+    if store.is_remote():
+        cmd.append("--write-bq")
     result = subprocess.run(
-        [sys.executable, str(Path(__file__).resolve().parent / "capex_pipeline.py"), "--skip-bq"],
+        cmd,
         capture_output=True, text=True, cwd=str(Path(__file__).resolve().parent),
+        timeout=300,
     )
     return jsonify({
         "message": "Pipeline re-exported" if result.returncode == 0 else "Pipeline failed",
@@ -1383,4 +1388,4 @@ def api_reexport():
 
 if __name__ == "__main__":
     print("Station Review UI: http://localhost:5051")
-    app.run(host="0.0.0.0", port=5051, debug=True)
+    app.run(host="0.0.0.0", port=5051, debug=os.environ.get("FLASK_DEBUG", "1") == "1")

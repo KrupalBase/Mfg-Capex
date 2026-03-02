@@ -160,6 +160,11 @@ python station_review_app.py
 ## Cloud Deployment (Google Cloud Run)
 
 Both apps share a single Docker image. The `APP_MODE` environment variable selects which app runs.
+Deploy scripts now support:
+- private Cloud Run services (`--no-allow-unauthenticated`)
+- explicit runtime service account
+- Secret Manager-backed OAuth/session secrets
+- optional Cloud Run Job deployment for daily incremental refresh
 
 ### Environment variables (set on Cloud Run)
 
@@ -167,23 +172,127 @@ Both apps share a single Docker image. The `APP_MODE` environment variable selec
 |---|---|
 | `APP_MODE` | `dashboard` or `review` |
 | `GCS_BUCKET` | GCS bucket name for data files |
-| `GOOGLE_CLIENT_ID` | OAuth 2.0 client ID |
-| `GOOGLE_CLIENT_SECRET` | OAuth 2.0 client secret |
-| `FLASK_SECRET_KEY` | Session signing key |
+| `BQ_ANALYTICS_PROJECT` | BigQuery project for analytics writes/reads |
+| `BQ_ANALYTICS_DATASET` | BigQuery analytics dataset (for example `capex_analytics`) |
+| `BQ_QUERY_PROJECT` | BigQuery project used for query job execution/billing |
+| `ODOO_SOURCE_PROJECT` | BigQuery project hosting Odoo source tables |
+| `ODOO_SOURCE_DATASET` | BigQuery dataset hosting Odoo source tables |
+| `REFRESH_EXECUTION_MODE` | `job` (recommended in cloud) or `subprocess` (local/default fallback) |
+| `REFRESH_JOB_NAME` | Cloud Run Job name used for on-demand refresh (default `capex-refresh-job`) |
+| `REFRESH_JOB_PROJECT` | Project that owns the refresh job |
+| `REFRESH_JOB_REGION` | Region that hosts the refresh job |
+| `REFRESH_TIMEOUT_SEC` | Timeout for refresh execution (`subprocess` mode and job runner) |
+| `REFRESH_USE_LOGGED_IN_OAUTH` | When `true`, on-demand refresh injects signed-in user OAuth token for Odoo/source pulls |
+| `USE_SIGNED_IN_USER_GCP` | When `false` (recommended), Gemini/LLM and non-refresh GCP calls use service account creds |
+| `PREFER_BIGQUERY_MAPPED_CSV` | When `true`, reads for `capex_clean.csv`/`capex_by_station.csv`/`spares_catalog.csv` are served from BigQuery first |
+| `ALLOW_MAPPED_CSV_FALLBACK` | Allow fallback to CSV/GCS for mapped datasets if BigQuery read fails (`false` recommended in cloud) |
+| `WRITE_MAPPED_CSV_TO_BIGQUERY` | When `true`, writes to mapped CSV aliases are mirrored to BigQuery tables |
+| `WRITE_MAPPED_CSV_TO_BIGQUERY_STRICT` | When `true`, mapped CSV writes fail if BigQuery mirror write fails |
+| `GOOGLE_CLIENT_ID` | OAuth 2.0 client ID (set via Secret Manager preferred) |
+| `GOOGLE_CLIENT_SECRET` | OAuth 2.0 client secret (set via Secret Manager preferred) |
+| `FLASK_SECRET_KEY` | Flask session signing key (set via Secret Manager preferred) |
+| `AUTH_DEBUG` | Optional, set `true` only for OAuth debugging (`/auth/debug`) |
+
+### Deploy script configuration
+
+The deploy scripts accept configuration through environment variables:
+
+| Variable | Default |
+|---|---|
+| `PROJECT` | `mfg-eng-19197` |
+| `REGION` | `us-central1` |
+| `GCS_BUCKET` | `capex-pipeline-data` |
+| `BQ_QUERY_PROJECT` | `<PROJECT>` |
+| `SERVICE_ACCOUNT` | `capex-dashboard-sa@<PROJECT>.iam.gserviceaccount.com` |
+| `REFRESH_JOB_NAME` | `capex-refresh-job` |
+| `REFRESH_EXECUTION_MODE` | auto: `job` when job is deployed, else `subprocess` |
+| `REFRESH_USE_LOGGED_IN_OAUTH` | `true` |
+| `USE_SIGNED_IN_USER_GCP` | `false` |
+| `PREFER_BIGQUERY_MAPPED_CSV` | `true` |
+| `ALLOW_MAPPED_CSV_FALLBACK` | `false` |
+| `WRITE_MAPPED_CSV_TO_BIGQUERY` | `true` |
+| `WRITE_MAPPED_CSV_TO_BIGQUERY_STRICT` | `true` |
+| `USE_SECRET_MANAGER` | `true` |
+| `GOOGLE_CLIENT_ID_SECRET` | `capex-google-client-id` |
+| `GOOGLE_CLIENT_SECRET_SECRET` | `capex-google-client-secret` |
+| `FLASK_SECRET_KEY_SECRET` | `capex-flask-secret-key` |
 
 ### Deploy
 
 ```powershell
-# PowerShell (builds image, deploys both services, optionally seeds data)
+# PowerShell (builds image, deploys services, deploys refresh job, optionally seeds data)
 cd bigquery
 .\deploy.ps1 -Seed
 ```
 
 ```bash
-# Bash
+# Bash (same behavior as PowerShell script)
 cd bigquery
 bash deploy.sh --seed
 ```
+
+Useful flags:
+- `--v2` / `-V2`: also deploy `capex-dashboard-v2`
+- `--no-job` / `-NoJob`: skip Cloud Run Job deployment
+- `--no-secrets` / `-NoSecrets`: inject auth via plain env vars (not recommended)
+
+### Daily refresh scheduling
+
+The deploy scripts can create the Cloud Run Job (`capex-refresh-job`).  
+Run ad-hoc refresh:
+
+```bash
+gcloud run jobs execute capex-refresh-job --project=<PROJECT> --region=<REGION> --wait
+```
+
+Recommended schedule (once per day) using Cloud Scheduler:
+
+```bash
+gcloud scheduler jobs create http capex-refresh-daily \
+  --project=<PROJECT> \
+  --location=<REGION> \
+  --schedule="0 8 * * *" \
+  --uri="https://<REGION>-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/<PROJECT>/jobs/capex-refresh-job:run" \
+  --http-method=POST \
+  --oauth-service-account-email=<SCHEDULER_SA_EMAIL> \
+  --oauth-token-scope="https://www.googleapis.com/auth/cloud-platform"
+```
+
+Grant the scheduler service account permission to invoke the job:
+
+```bash
+gcloud projects add-iam-policy-binding <PROJECT> \
+  --member="serviceAccount:<SCHEDULER_SA_EMAIL>" \
+  --role="roles/run.invoker"
+```
+
+### Gmail alerting setup (failure + staleness)
+
+Use the helper script to configure scheduler + Monitoring alert policies with email notifications:
+
+```powershell
+cd bigquery
+.\setup_scheduler_alerts.ps1 `
+  -Project "mfg-eng-19197" `
+  -Region "us-central1" `
+  -AlertEmails @("you@basepowercompany.com")
+```
+
+Notes:
+- If `data/dashboard_settings.json` has `ops_refresh_cron`, `ops_refresh_timezone`, and `ops_alert_emails`, the script uses those defaults automatically.
+- Alert policies created:
+  - `CAPEX Refresh Job Failure` (triggered by `refresh_job_failed` event logs)
+  - `CAPEX Refresh Stale (No Success > 26h)` (absence of success events)
+- You may need `gcloud alpha`/`gcloud beta` components installed for Monitoring channel/policy commands.
+
+### Staging and cutover (v2)
+
+Recommended promotion flow for `capex-dashboard-v2`:
+- Deploy v2 with job-backed refresh enabled (`REFRESH_EXECUTION_MODE=job`) and verify `/api/v2/refresh-status` reports the expected `execution_mode` and `job_name`.
+- Run one on-demand refresh from Settings and confirm status transitions `running -> ok` with no lock/cooldown errors.
+- Compare v2 vs current production on key pages: Executive Summary totals, Payment Milestones, Cashflow, and drill-down row counts for at least 3 representative stations/POs.
+- Validate access control: owner can manage editor emails, editors can run refresh/upload/actions, viewers are blocked from settings mutations.
+- Keep rollback simple: leave current production service deployed, and only update links/traffic after parity checks pass.
 
 ## Data Flow
 

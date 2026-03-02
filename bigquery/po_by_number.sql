@@ -1,5 +1,5 @@
 -- Single PO by number: line-level data with Vendor, Project, and key PO fields.
--- Dataset: gtm-analytics-447201.odoo_public
+-- Dataset: {odoo_source}
 -- Usage: set @po_number in the script or replace 'PO12060' below.
 
 SELECT
@@ -41,11 +41,11 @@ SELECT
   po.notes AS po_notes,
   po.create_date AS po_created_date,
   po.write_date AS po_updated_date
-FROM `gtm-analytics-447201.odoo_public.purchase_order` po
-JOIN `gtm-analytics-447201.odoo_public.purchase_order_line` pol ON pol.order_id = po.id
-LEFT JOIN `gtm-analytics-447201.odoo_public.res_partner` v ON po.partner_id = v.id
-LEFT JOIN `gtm-analytics-447201.odoo_public.account_analytic_account` aaa ON pol.analytic_account_project_id = aaa.id
-LEFT JOIN `gtm-analytics-447201.odoo_public.res_users` creator_u ON po.create_uid = creator_u.id
-LEFT JOIN `gtm-analytics-447201.odoo_public.res_partner` creator_p ON creator_u.partner_id = creator_p.id
+FROM `{odoo_source}.purchase_order` po
+JOIN `{odoo_source}.purchase_order_line` pol ON pol.order_id = po.id
+LEFT JOIN `{odoo_source}.res_partner` v ON po.partner_id = v.id
+LEFT JOIN `{odoo_source}.account_analytic_account` aaa ON pol.analytic_account_project_id = aaa.id
+LEFT JOIN `{odoo_source}.res_users` creator_u ON po.create_uid = creator_u.id
+LEFT JOIN `{odoo_source}.res_partner` creator_p ON creator_u.partner_id = creator_p.id
 WHERE po.name = 'PO12060'
 ORDER BY pol.sequence;

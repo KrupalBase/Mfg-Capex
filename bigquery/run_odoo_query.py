@@ -1,22 +1,20 @@
 """
-Run a BigQuery query against gtm-analytics-447201.odoo_public.
+Run a BigQuery query against Odoo source dataset.
 Uses Application Default Credentials (run: gcloud auth application-default login).
 """
 from __future__ import annotations
 
-from google.cloud import bigquery
+import bq_dataset
 
-
-PROJECT_ID = "gtm-analytics-447201"
-DATASET = "odoo_public"
 TABLE = "account_account"
 LIMIT = 1000
 
 
 def main() -> None:
-    client = bigquery.Client(project=PROJECT_ID)
+    client = bq_dataset.get_source_client()
+    fq_table = bq_dataset.source_table(TABLE)
     query = f"""
-        SELECT * FROM `{PROJECT_ID}.{DATASET}.{TABLE}`
+        SELECT * FROM {fq_table}
         LIMIT {LIMIT}
     """
     print(f"Running: {query.strip()}")

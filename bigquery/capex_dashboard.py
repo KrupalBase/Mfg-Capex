@@ -6,12 +6,26 @@ Open: http://localhost:5050
 """
 from __future__ import annotations
 
+import os
+import time
 from pathlib import Path
+from threading import Lock
 
 import pandas as pd
 from flask import Flask, jsonify, render_template_string, request
 
 import storage_backend as store
+from access_control import (
+    current_user_email,
+    EDITORS_KEY,
+    OWNER_KEY,
+    ensure_access_defaults,
+    get_access_context,
+    is_company_email,
+    load_settings_with_access_defaults,
+    normalize_email,
+    normalize_email_list,
+)
 from auth import get_google_access_token, init_auth
 
 app = Flask(__name__)
@@ -22,8 +36,27 @@ init_auth(app)
 # Data loading -- delegates to storage_backend (local or GCS)
 # ---------------------------------------------------------------------------
 
+_CSV_CACHE_TTL_SEC = float(
+    os.environ.get("CSV_CACHE_TTL_SEC", "20" if store.is_remote() else "0")
+)
+_CSV_CACHE: dict[str, tuple[float, pd.DataFrame]] = {}
+_CSV_CACHE_LOCK = Lock()
+
+
 def _load_csv(name: str) -> pd.DataFrame:
-    return store.read_csv(name)
+    if _CSV_CACHE_TTL_SEC <= 0:
+        return store.read_csv(name)
+
+    now = time.time()
+    with _CSV_CACHE_LOCK:
+        cached = _CSV_CACHE.get(name)
+        if cached and (now - cached[0]) <= _CSV_CACHE_TTL_SEC:
+            return cached[1].copy(deep=True)
+
+    fresh = store.read_csv(name)
+    with _CSV_CACHE_LOCK:
+        _CSV_CACHE[name] = (now, fresh)
+    return fresh.copy(deep=True)
 
 
 def _load_stations_json() -> list[dict]:
@@ -132,6 +165,7 @@ DEFAULT_BF2_SHEET_URL = (
     "https://docs.google.com/spreadsheets/d/1ngtchHeES3R3QmffpizlD8l4j3U8LtJO8BYTClqvq3E/"
     "edit?gid=657859777#gid=657859777"
 )
+RFQ_SYSTEM_PROMPT_TEMPLATE = Path(__file__).resolve().parent / "prompts" / "rfq_system.txt"
 
 
 def _build_forecasting_rows(by_station: pd.DataFrame) -> tuple[list[dict], list[dict]]:
@@ -411,8 +445,9 @@ def api_summary():
 
     payment_summary: dict = {"available": False}
     odoo_df = df[df["source"] == "odoo"].copy()
-    if not odoo_df.empty and "bill_payment_status" in odoo_df.columns:
-        pay_state = odoo_df["bill_payment_status"].fillna("").astype(str).str.strip().replace("", "no_bill")
+    status_col = "po_payment_status_v2" if "po_payment_status_v2" in odoo_df.columns else "bill_payment_status"
+    if not odoo_df.empty and status_col in odoo_df.columns:
+        pay_state = odoo_df[status_col].fillna("").astype(str).str.strip().replace("", "no_bill")
         paid_spend = float(odoo_df.loc[pay_state == "paid", "_sub"].sum())
         partial_spend = float(odoo_df.loc[pay_state == "partial", "_sub"].sum())
         unpaid_spend = float(odoo_df.loc[pay_state == "unpaid", "_sub"].sum())
@@ -423,6 +458,7 @@ def api_summary():
         odoo_committed = float(odoo_df["_sub"].sum())
         payment_summary = {
             "available": True,
+            "status_source": status_col,
             "odoo_committed": odoo_committed,
             "paid_spend": paid_spend,
             "partial_spend": partial_spend,
@@ -484,6 +520,81 @@ def api_summary():
         "payment": payment_summary,
         "ramp_payment": ramp_payment,
     })
+
+
+@app.route("/api/payment-evidence")
+def api_payment_evidence():
+    """PO-level payment evidence table for status transparency."""
+    df = _load_csv("capex_clean.csv")
+    if df.empty:
+        return jsonify({"rows": [], "count": 0})
+    df = _apply_line_filter(df)
+    if "source" in df.columns:
+        df = df[df["source"] == "odoo"].copy()
+    if df.empty or "po_number" not in df.columns:
+        return jsonify({"rows": [], "count": 0})
+
+    for c in ("price_subtotal", "po_amount_total", "bill_amount_total_v2", "bill_amount_paid_v2", "bill_amount_open_v2"):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+
+    status_col = "po_payment_status_v2" if "po_payment_status_v2" in df.columns else "bill_payment_status"
+
+    def _first_nonempty(series: pd.Series, default: str = "") -> str:
+        vals = series.fillna("").astype(str).str.strip()
+        vals = vals[vals != ""]
+        return vals.iloc[0] if not vals.empty else default
+
+    def _num_max(group: pd.DataFrame, col: str, default: float = 0.0) -> float:
+        if col not in group.columns:
+            return float(default)
+        ser = pd.to_numeric(group[col], errors="coerce").fillna(default)
+        return float(ser.max() if len(ser) else default)
+
+    def _bool_any(group: pd.DataFrame, col: str) -> bool:
+        if col not in group.columns:
+            return False
+        ser = group[col]
+        try:
+            return bool(ser.fillna(False).astype(bool).any())
+        except Exception:
+            return bool(
+                ser.fillna("")
+                .astype(str)
+                .str.strip()
+                .str.lower()
+                .isin({"1", "true", "yes", "y"})
+                .any()
+            )
+
+    rows: list[dict] = []
+    for po, g in df.groupby("po_number"):
+        po_total = _num_max(g, "po_amount_total", 0.0)
+        spend_total = float(pd.to_numeric(g.get("price_subtotal", 0), errors="coerce").sum())
+        billed = _num_max(g, "bill_amount_total_v2", 0.0)
+        paid = _num_max(g, "bill_amount_paid_v2", 0.0)
+        open_amt = _num_max(g, "bill_amount_open_v2", 0.0)
+        rows.append({
+            "po_number": str(po),
+            "vendor_name": _first_nonempty(g.get("vendor_name", pd.Series(dtype=str))),
+            "created_by_name": _first_nonempty(g.get("created_by_name", pd.Series(dtype=str))),
+            "po_total": po_total,
+            "line_spend_total": spend_total,
+            "billed_total_v2": billed,
+            "paid_total_v2": paid,
+            "open_total_v2": open_amt,
+            "paid_pct_of_po": (paid / po_total * 100) if po_total else 0.0,
+            "status_v2": _first_nonempty(g.get(status_col, pd.Series(dtype=str)), "no_bill"),
+            "confidence": _first_nonempty(g.get("payment_status_confidence", pd.Series(dtype=str))),
+            "has_unbilled_signal": _bool_any(g, "has_unbilled_payment_signal"),
+            "has_deposit_signal": _bool_any(g, "has_deposit_signal"),
+            "evidence_notes": _first_nonempty(g.get("payment_evidence_notes", pd.Series(dtype=str))),
+        })
+
+    rows.sort(key=lambda r: r["po_total"], reverse=True)
+    limit = request.args.get("limit", 250, type=int) or 250
+    limit = max(1, min(limit, 1000))
+    return jsonify({"rows": rows[:limit], "count": len(rows)})
 
 
 @app.route("/api/stations")
@@ -637,7 +748,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Mfg Budgeting App</title>
+<title>Base Power - Mfg Budgeting</title>
 <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
 <link rel="stylesheet" href="https://cdn.datatables.net/1.13.7/css/jquery.dataTables.min.css">
 <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
@@ -655,6 +766,8 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--
 .sidebar-brand{padding:20px 18px 16px;border-bottom:1px solid var(--border)}
 .sidebar-brand h2{font-size:15px;font-weight:700;color:var(--green);letter-spacing:.5px}
 .sidebar-brand .sub{font-size:10px;color:var(--muted);margin-top:2px;text-transform:uppercase;letter-spacing:1px}
+.nav-section-title{padding:10px 18px 6px;font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.9px;font-weight:700}
+.nav-section-title.with-divider{border-top:1px solid var(--border);margin-top:6px;padding-top:12px}
 .nav-item{display:flex;align-items:center;gap:10px;padding:11px 18px;color:var(--muted);text-decoration:none;font-size:13px;cursor:pointer;border-left:3px solid transparent;transition:all .15s}
 .nav-item:hover{background:var(--surface2);color:var(--text)}
 .nav-item.active{color:var(--green);border-left-color:var(--green);background:rgba(178,221,121,.06);font-weight:600}
@@ -675,16 +788,45 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--
 .chart-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:24px}
 .chart-card{background:var(--surface);border-radius:10px;padding:18px;border:1px solid var(--border);overflow:hidden}
 .chart-card.full{grid-column:1/-1}
-.chart-card h3{font-size:12px;margin-bottom:14px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;font-weight:600}
+.chart-card h3{font-size:12px;margin-bottom:14px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;font-weight:600;padding-right:120px}
+.js-plotly-plot .plotly .modebar{
+    background:rgba(36,36,34,.9)!important;
+    border:1px solid var(--border)!important;
+    border-radius:6px!important;
+    padding:2px!important;
+}
+.chart-card .js-plotly-plot .plotly .modebar{
+    top:-30px!important;
+    right:0!important;
+    z-index:20!important;
+}
 .filter-bar{display:flex;gap:12px;margin-bottom:20px;flex-wrap:wrap;align-items:center}
 .filter-bar select,.filter-bar input{background:var(--surface2);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:8px 14px;font-size:13px;outline:none;transition:border-color .15s}
 .filter-bar select:focus,.filter-bar input:focus{border-color:var(--green)}
 .filter-bar label{font-size:11px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.5px}
 table.dataTable{color:var(--text)!important;background:var(--surface)!important;border-collapse:collapse!important;width:100%!important;font-size:12px!important}
-table.dataTable{table-layout:auto!important}
+table.dataTable{table-layout:fixed!important}
+div.dataTables_scrollHead table,div.dataTables_scrollBody table{table-layout:fixed!important}
 table.dataTable thead th{background:var(--surface2)!important;color:var(--muted)!important;border-bottom:1px solid var(--border)!important;font-size:11px!important;padding:10px 8px!important;text-transform:uppercase;letter-spacing:.3px;font-weight:600;overflow:hidden;min-width:60px}
 table.dataTable tbody td{border-bottom:1px solid rgba(62,61,58,.5)!important;padding:8px!important;max-width:350px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 table.dataTable tbody tr:hover{background:rgba(178,221,121,.05)!important}
+body.tables-expanded table.dataTable tbody td{max-width:none!important;white-space:normal!important;overflow:visible!important;text-overflow:clip!important;word-break:break-word}
+body.tables-expanded table.dataTable{table-layout:auto!important}
+body.tables-expanded div.dataTables_scrollHead table,
+body.tables-expanded div.dataTables_scrollBody table{table-layout:auto!important}
+body.tables-expanded table.dataTable thead th{white-space:nowrap!important}
+#detail-table-wrap.detail-expanded table#detail-tbl.dataTable{table-layout:auto!important;width:max-content!important;min-width:100%!important}
+#detail-table-wrap.detail-expanded table#detail-tbl.dataTable thead th{width:auto!important;min-width:110px!important;white-space:nowrap!important}
+#detail-table-wrap.detail-expanded table#detail-tbl.dataTable tbody td{width:auto!important;max-width:none!important;white-space:normal!important;overflow:visible!important;text-overflow:clip!important;word-break:break-word}
+.detail-native-toolbar{display:flex;gap:10px;align-items:center;justify-content:space-between;margin:6px 0 10px;flex-wrap:wrap}
+.detail-native-toolbar .left{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.detail-native-toolbar .right{font-size:12px;color:var(--muted)}
+.detail-native-search{min-width:260px;background:var(--surface2);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:8px 10px;font-size:12px}
+.detail-native-wrap{border:1px solid var(--border);border-radius:8px;overflow:auto;max-height:70vh;background:var(--surface)}
+table.detail-native-table{color:var(--text);background:var(--surface);border-collapse:collapse;width:max-content;min-width:100%;font-size:12px;table-layout:auto}
+table.detail-native-table thead th{position:sticky;top:0;z-index:2;background:var(--surface2);color:var(--muted);border-bottom:1px solid var(--border);font-size:11px;padding:10px 8px;text-transform:uppercase;letter-spacing:.3px;font-weight:600;white-space:nowrap}
+table.detail-native-table tbody td{border-bottom:1px solid rgba(62,61,58,.5);padding:8px;max-width:none;white-space:normal;overflow:visible;text-overflow:clip;word-break:break-word;vertical-align:top}
+table.detail-native-table tbody tr:hover{background:rgba(178,221,121,.05)}
 .dataTables_wrapper .dataTables_filter input{background:var(--surface2)!important;color:var(--text)!important;border:1px solid var(--border)!important;border-radius:6px;padding:6px 10px}
 .dataTables_wrapper .dataTables_length select{background:var(--surface2)!important;color:var(--text)!important;border:1px solid var(--border)!important}
 .dataTables_wrapper .dataTables_info,.dataTables_wrapper .dataTables_paginate{color:var(--muted)!important;font-size:11px!important}
@@ -722,6 +864,9 @@ table.dataTable tfoot th{padding:4px 4px!important;background:var(--surface2)!im
 table.dataTable tfoot input{width:100%;padding:4px 6px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:3px;font-size:10px;outline:none;box-sizing:border-box}
 table.dataTable tfoot input:focus{border-color:var(--green)}
 table.dataTable tfoot input::placeholder{color:var(--muted);font-size:10px}
+.dataTables_wrapper table.dataTable thead tr.dt-filter-row th{background:var(--surface)!important;padding:4px 6px!important;border-bottom:1px solid var(--border)!important}
+.dataTables_wrapper table.dataTable thead tr.dt-filter-row input{width:100%;padding:4px 6px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:3px;font-size:10px;outline:none;box-sizing:border-box}
+.dataTables_wrapper table.dataTable thead tr.dt-filter-row input:focus{border-color:var(--green)}
 .dt-resizable thead th{position:relative;overflow:visible!important}
 .col-resizer{position:absolute;top:0;right:0;width:14px;height:100%;cursor:col-resize;z-index:3;touch-action:none}
 .col-resizer:hover{background:rgba(178,221,121,.18)}
@@ -732,12 +877,6 @@ body.col-resize-active{cursor:col-resize;user-select:none}
 .asset-date{background:var(--surface2);color:var(--text);border:1px solid var(--border);border-radius:3px;padding:2px 4px;width:105px;font-size:10px;cursor:pointer}
 .asset-date:focus{border-color:var(--green);outline:none}
 .asset-date::-webkit-calendar-picker-indicator{filter:invert(.7)}
-.export-heading{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;font-weight:600;margin-bottom:8px}
-.export-row{display:flex;gap:6px}
-.btn-export{flex:1;padding:8px;background:var(--surface2);color:var(--text);border:1px solid var(--border);border-radius:6px;font-size:10px;font-weight:700;cursor:pointer}
-.btn-export:hover{border-color:var(--green);color:var(--green)}
-.btn-export:disabled{opacity:.6;cursor:wait}
-.export-note{margin-top:6px;font-size:10px;color:var(--muted);line-height:1.2;min-height:24px}
 .about-hero{background:linear-gradient(135deg,rgba(178,221,121,.14),rgba(4,142,229,.12));border:1px solid var(--border);border-radius:12px;padding:20px 22px;margin-bottom:16px}
 .about-hero h3{font-size:18px;color:var(--text);margin-bottom:8px}
 .about-hero p{font-size:13px;color:var(--text);line-height:1.5;max-width:980px}
@@ -790,24 +929,84 @@ body.col-resize-active{cursor:col-resize;user-select:none}
 .about-details summary::-webkit-details-marker{display:none}
 .about-details-body{padding:0 12px 12px}
 @media(max-width:1200px){.about-rules{grid-template-columns:1fr}}
+.mobile-header{display:none;position:fixed;top:0;left:0;right:0;z-index:200;background:var(--surface);border-bottom:1px solid var(--border);padding:10px 16px;align-items:center;gap:12px}
+.mobile-header .hamburger{background:none;border:none;color:var(--green);font-size:22px;cursor:pointer;padding:4px 8px;line-height:1}
+.mobile-header .brand{font-size:14px;font-weight:700;color:var(--green);letter-spacing:.4px}
+.mobile-header .brand span{color:var(--muted);font-weight:400;font-size:11px;margin-left:6px;text-transform:uppercase;letter-spacing:.8px}
+.sidebar-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:299}
+@media(max-width:1024px){
+.sidebar{transform:translateX(-100%);z-index:300;transition:transform .25s ease;width:260px}
+.sidebar.open{transform:translateX(0)}
+.sidebar-overlay.visible{display:block}
+.mobile-header{display:flex}
+.main{margin-left:0;padding:68px 16px 24px}
+.chart-grid{grid-template-columns:1fr}
+.kpi-row{grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px}
+.page-title{font-size:17px}
+.page-subtitle{font-size:11px}
+.chart-card{padding:14px}
+.chart-card h3{font-size:11px;padding-right:0}
+.filter-bar{gap:8px}
+.filter-bar select,.filter-bar input{font-size:12px;padding:6px 10px}
+.about-grid{grid-template-columns:1fr}
+.about-flow-row{flex-direction:column}
+.about-arrow{transform:rotate(90deg);text-align:center}
+.about-journey{flex-direction:column}
+.about-rules{grid-template-columns:1fr}
+.about-metric-grid{grid-template-columns:repeat(auto-fit,minmax(160px,1fr))}
+.detail-native-toolbar{flex-direction:column;align-items:stretch}
+.detail-native-search{min-width:unset;width:100%}
+.station-select{min-width:unset;width:100%}
+}
+@media(max-width:600px){
+.main{padding:64px 10px 20px}
+.kpi-row{grid-template-columns:1fr 1fr;gap:8px}
+.kpi{padding:12px 14px}
+.kpi .value{font-size:18px}
+.kpi .label{font-size:9px}
+.chart-card{padding:10px;border-radius:8px}
+.page-header{flex-direction:column;align-items:flex-start;gap:4px}
+table.dataTable thead th{font-size:10px!important;padding:6px 4px!important}
+table.dataTable tbody td{font-size:11px!important;padding:6px 4px!important}
+.toast{bottom:12px;right:12px;left:12px;text-align:center}
+.forecast-input{width:80px;font-size:11px}
+}
 </style>
 </head>
 <body>
 
+<div class="mobile-header">
+    <button class="hamburger" onclick="toggleSidebar()" aria-label="Menu">&#9776;</button>
+    <div class="brand">MFG BUDGETING<span>Base Power</span></div>
+</div>
+<div class="sidebar-overlay" onclick="toggleSidebar()"></div>
+
 <div class="sidebar">
     <div class="sidebar-brand"><h2>MFG BUDGETING</h2><div class="sub">Base Power Company</div></div>
-    <a class="nav-item active" onclick="showPage('executive',this)"><span class="icon">&#9632;</span> Executive Summary</a>
+    <div class="nav-section-title">Overview</div>
+    <a class="nav-item active" onclick="showPage('executive',this)"><span class="icon">&#128200;</span> Executive Summary</a>
     <a class="nav-item" onclick="showPage('source',this)"><span class="icon">&#8644;</span> Odoo vs Ramp</a>
-    <a class="nav-item" onclick="showPage('stations',this)"><span class="icon">&#9881;</span> Station Drill-Down</a>
-    <a class="nav-item" onclick="showPage('forecasting',this)"><span class="icon">&#128202;</span> Forecasting</a>
-    <a class="nav-item" onclick="showPage('vendors',this)"><span class="icon">&#9733;</span> Vendor Analysis</a>
-    <a class="nav-item" onclick="showPage('assets',this)"><span class="icon">&#9878;</span> Asset Tracking</a>
-    <a class="nav-item" onclick="showPage('spares',this)"><span class="icon">&#9776;</span> Materials / Spares</a>
-    <a class="nav-item" onclick="showPage('detail',this)"><span class="icon">&#9783;</span> Full Transactions</a>
-    <a class="nav-item" onclick="showPage('timeline',this)"><span class="icon">&#9202;</span> Spend Timeline</a>
+    <a class="nav-item" onclick="showPage('timeline',this)"><span class="icon">&#128197;</span> Spend Timeline</a>
+    <a class="nav-item" onclick="showPage('detail',this)"><span class="icon">&#128203;</span> Transactions (All)</a>
+
+    <div class="nav-section-title with-divider">Analysis</div>
+    <a class="nav-item" onclick="showPage('stations',this)"><span class="icon">&#128295;</span> Station Drilldown</a>
+    <a class="nav-item" onclick="showPage('vendors',this)"><span class="icon">&#128188;</span> Vendor Analysis</a>
+    <a class="nav-item" onclick="showPage('assets',this)"><span class="icon">&#127970;</span> Asset Tracking</a>
+    <a class="nav-item" onclick="showPage('spares',this)"><span class="icon">&#128230;</span> Materials &amp; Spares</a>
     <a class="nav-item" onclick="showPage('projects',this)"><span class="icon">&#9670;</span> Other Projects</a>
     <a class="nav-item" onclick="showPage('uniteco',this)"><span class="icon">&#9879;</span> Unit Economics</a>
+
+    <div class="nav-section-title with-divider">Planning &amp; Cashflow</div>
+    <a class="nav-item" onclick="showPage('forecasting',this)"><span class="icon">&#128202;</span> Forecasting</a>
+    <a class="nav-item" onclick="showPage('v2milestones',this)"><span class="icon">&#128336;</span> Payment Timeline</a>
+    <a class="nav-item" onclick="showPage('v2templates',this)"><span class="icon">&#128221;</span> Milestone Templates</a>
+    <a class="nav-item" onclick="showPage('airfq',this)"><span class="icon">&#129302;</span> AI-RFQ Gen</a>
+    <a class="nav-item" onclick="showPage('v2cashflow',this)"><span class="icon">&#128176;</span> Cashflow Forecast</a>
+
+    <div class="nav-section-title with-divider">Admin</div>
     <a class="nav-item" onclick="showPage('settings',this)"><span class="icon">&#9881;</span> Settings</a>
+    <a class="nav-item" onclick="showPage('v2reviews',this)"><span class="icon">&#9998;</span> Classification Review</a>
     <a class="nav-item" onclick="showPage('about',this)"><span class="icon">&#8505;</span> About This Tool</a>
     <div style="padding:12px 18px;border-top:1px solid var(--border)">
         <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;font-weight:600;margin-bottom:8px">Filter by Line</div>
@@ -816,15 +1015,9 @@ body.col-resize-active{cursor:col-resize;user-select:none}
             <button onclick="toggleAllLines(true)" style="flex:1;padding:4px;background:var(--green);color:var(--accent-dark);border:none;border-radius:4px;font-size:10px;font-weight:700;cursor:pointer">All</button>
             <button onclick="toggleAllLines(false)" style="flex:1;padding:4px;background:var(--secondary);color:var(--text);border:none;border-radius:4px;font-size:10px;font-weight:700;cursor:pointer">None</button>
         </div>
+        <button id="btn-table-expand" onclick="toggleTableExpand()" style="margin-top:8px;width:100%;padding:6px;background:var(--surface2);color:var(--text);border:1px solid var(--border);border-radius:4px;font-size:10px;font-weight:700;cursor:pointer">Expand Tables</button>
     </div>
-    <div class="sidebar-footer">
-        <div class="export-heading">Export Current Tab Data</div>
-        <div class="export-row">
-            <button class="btn-export" id="export-csv-btn" onclick="exportCurrentPage('csv')">CSV</button>
-            <button class="btn-export" id="export-xlsx-btn" onclick="exportCurrentPage('xlsx')">Excel</button>
-        </div>
-        <div class="export-note" id="export-note">Graphs + tables for active tab</div>
-    </div>
+    <div class="sidebar-footer"></div>
 </div>
 
 <div class="main">
@@ -841,299 +1034,129 @@ body.col-resize-active{cursor:col-resize;user-select:none}
         <div class="chart-card"><h3>Odoo PO Payment Status</h3><div id="chart-payment-status"></div></div>
         <div class="chart-card"><h3>Ramp CC Payment Status</h3><div id="chart-ramp-payment"></div></div>
         <div class="chart-card full"><h3>Spend by Employee</h3><div id="chart-employees"></div></div>
+        <div class="chart-card full"><h3>Payment Evidence (PO-Level)</h3><div id="payment-evidence-wrap"></div></div>
     </div>
 </div>
 
 <!-- ABOUT -->
 <div class="page" id="page-about">
-    <div class="page-header"><div><div class="page-title">About This Tool</div><div class="page-subtitle">Current-state overview of the CAPEX data pipeline and cleanup rules</div></div></div>
+    <div class="page-header"><div><div class="page-title">About &amp; Operating Guide</div><div class="page-subtitle">What this dashboard does, how data moves, and how to run it with confidence</div></div></div>
 
     <div class="about-hero">
-        <h3>What this dashboard is doing today</h3>
+        <h3>Prime-time operating view</h3>
         <p>
-            This dashboard combines manufacturing CAPEX spend from Odoo purchase orders and Ramp card transactions, then applies station mapping, cleanup rules, and forecast logic before showing the final results.
-            This page documents the current implementation as it exists now.
+            This dashboard is a manufacturing CAPEX control tower for Odoo purchase orders, Ramp card spend, payment timelines, and cashflow forecasting.
+            Use this page as a quick runbook for data trust, refresh cadence, and workflow.
         </p>
         <div class="about-pill-row">
-            <span class="about-pill warn">Processing model: Batch / Manual run</span>
-            <span class="about-pill note">Data window: Last 7 months (Odoo SQL pull)</span>
-            <span class="about-pill ok">Outputs: capex_clean, capex_by_station, spares_catalog</span>
+            <span class="about-pill note">Data model: batch refresh + incremental updates</span>
+            <span class="about-pill warn">Refresh trigger: Settings &rarr; Data Management</span>
+            <span class="about-pill ok">Outputs: executive KPIs, drilldowns, milestones, cashflow</span>
         </div>
     </div>
 
     <div class="about-metric-grid">
-        <div class="about-metric"><div class="k">Execution Trigger</div><div class="v">Manual CLI</div><div class="d"><code>python capex_pipeline.py</code> or <code>--skip-bq</code></div></div>
-        <div class="about-metric"><div class="k">Freshness Model</div><div class="v">Snapshot-Based</div><div class="d">UI reads exported CSV snapshots, not live source systems.</div></div>
-        <div class="about-metric"><div class="k">Real-Time Boundary</div><div class="v">No Streaming Job</div><div class="d">No Pub/Sub, Dataflow, or event trigger in current pipeline path.</div></div>
-        <div class="about-metric"><div class="k">Core Output Contracts</div><div class="v">3 Primary Files</div><div class="d"><code>capex_clean.csv</code>, <code>capex_by_station.csv</code>, <code>spares_catalog.csv</code></div></div>
+        <div class="about-metric"><div class="k">Primary Sources</div><div class="v">Odoo + Ramp</div><div class="d">PO lines, bill/payment evidence, and card spend context.</div></div>
+        <div class="about-metric"><div class="k">Storage Pattern</div><div class="v">Analytics Backend</div><div class="d">Unified cleaned dataset feeds dashboard APIs and export views.</div></div>
+        <div class="about-metric"><div class="k">Classification Model</div><div class="v">Rules + LLM Review</div><div class="d">Deterministic defaults with review queue for disagreements.</div></div>
+        <div class="about-metric"><div class="k">Planning Model</div><div class="v">Actual + Template</div><div class="d">Cashflow forecast combines actuals and milestone templates.</div></div>
     </div>
 
     <div class="chart-card full" style="margin-bottom:14px">
-        <h3>Block Diagram: End-to-End Data Path</h3>
-        <div class="about-flow">
-            <div class="about-flow-row">
-                <div class="about-node"><h5>Source Layer</h5><p>Odoo via BigQuery SQL<br/>Ramp transaction CSV<br/>BF1/BF2 station metadata + forecast/override JSON</p></div>
-                <div class="about-arrow">&#8594;</div>
-                <div class="about-node"><h5>Batch Orchestrator</h5><p><code>capex_pipeline.py</code><br/>steps 1..11 executed sequentially</p></div>
-                <div class="about-arrow">&#8594;</div>
-                <div class="about-node"><h5>Rule Engine</h5><p>Cleanup + type tagging + station mapping + subcategory classification + dedupe + validations</p></div>
-                <div class="about-arrow">&#8594;</div>
-                <div class="about-node"><h5>Output Artifacts</h5><p>CSV exports + settings/override files written to storage backend (local/GCS)</p></div>
+        <h3>Navigation Guide</h3>
+        <div class="about-grid">
+            <div class="about-card">
+                <h4>Overview</h4>
+                <ul>
+                    <li><strong>Executive Summary</strong>: top-line KPIs, trend views, payment evidence.</li>
+                    <li><strong>Odoo vs Ramp</strong>: source comparison and payment accounting split.</li>
+                    <li><strong>Spend Timeline</strong>: monthly/weekly trend and source-mix drilldowns.</li>
+                    <li><strong>Transactions (All)</strong>: complete row-level transaction ledger.</li>
+                </ul>
             </div>
-            <div class="about-flow-row">
-                <div class="about-node"><h5>Consumer Layer</h5><p>Dashboard APIs load exported CSVs<br/>Forecasting tab applies per-station overrides<br/>Review app applies human mapping corrections</p></div>
-                <div class="about-arrow">&#8592;</div>
-                <div class="about-node"><h5>Feedback Loop</h5><p>Human corrections are persisted and become inputs for next pipeline run.</p></div>
+            <div class="about-card">
+                <h4>Analysis</h4>
+                <ul>
+                    <li><strong>Station Drilldown</strong>: station-level spend, vendors, and BOM detail.</li>
+                    <li><strong>Vendor Analysis</strong>: concentration and vendor-to-station patterns.</li>
+                    <li><strong>Asset Tracking</strong>: equipment lifecycle and installation status.</li>
+                    <li><strong>Materials &amp; Spares</strong>: deduped catalog, pricing, and sourcing.</li>
+                </ul>
             </div>
+            <div class="about-card">
+                <h4>Planning &amp; Cashflow</h4>
+                <ul>
+                    <li><strong>Forecasting</strong>: line and station forecast baselines.</li>
+                    <li><strong>Payment Timeline</strong>: PO payment sequence and timing behavior.</li>
+                    <li><strong>Milestone Templates</strong>: expected payment plans by PO.</li>
+                    <li><strong>Cashflow Forecast</strong>: actual paid vs projected outflow.</li>
+                </ul>
+        </div>
+            <div class="about-card">
+                <h4>Admin</h4>
+                <ul>
+                    <li><strong>Settings</strong>: data refresh, filters, AI prompts, and operations.</li>
+                    <li><strong>Classification Review</strong>: resolve AI/rules mismatches.</li>
+                    <li><strong>About &amp; Operating Guide</strong>: workflow, trust model, limitations.</li>
+                </ul>
+    </div>
         </div>
     </div>
 
     <div class="chart-card full" style="margin-bottom:14px">
-        <h3>Technical Execution Map (Function-Level)</h3>
-        <div class="about-timeline">
-            <div class="about-step"><div class="num">1</div><div class="body"><strong>Extract</strong>Run <code>step1_pull_bigquery()</code> or <code>step1_load_existing()</code>; SQL source query is <code>po_by_creators_last_7m.sql</code>.</div></div>
-            <div class="about-step"><div class="num">2</div><div class="body"><strong>Ingest Ramp</strong><code>step2_load_ramp()</code> uses <code>load_and_normalize_ramp()</code> to map category, shape columns, and generate stable IDs.</div></div>
-            <div class="about-step"><div class="num">3</div><div class="body"><strong>Station Metadata</strong><code>step3_load_stations()</code> loads station master/cost rows and falls back to cached JSON if workbook is missing.</div></div>
-            <div class="about-step"><div class="num">4</div><div class="body"><strong>Cleanup</strong><code>step4_clean_odoo()</code> applies text/date/amount standardization, category splitting, section merge, and part-number extraction.</div></div>
-            <div class="about-step"><div class="num">5</div><div class="body"><strong>Unify + Map</strong><code>step6_concatenate()</code> creates a unified frame; <code>step7_map_stations()</code> assigns line type, CAPEX flags, and station/confidence.</div></div>
-            <div class="about-step"><div class="num">6</div><div class="body"><strong>Human Control + Enrichment</strong><code>step8_apply_overrides()</code> enforces human station overrides; <code>step9_classify_subcategories()</code> sets manufacturing subcategories.</div></div>
-            <div class="about-step"><div class="num">7</div><div class="body"><strong>Export + Metrics</strong><code>step10_export()</code> writes output contracts and computes station variance; <code>step11_summary()</code> logs run totals and mapping status.</div></div>
+        <h3>Data Flow (High Level)</h3>
+            <div class="about-flow">
+                <div class="about-flow-row">
+                <div class="about-node"><h5>Inputs</h5><p>Odoo PO + billing/payment context, Ramp spend feed, manual additions, and settings controls.</p></div>
+                    <div class="about-arrow">&#8594;</div>
+                <div class="about-node"><h5>Processing</h5><p>Cleanup, dedupe, station mapping, subcategory classification, and payment status reconciliation.</p></div>
+                    <div class="about-arrow">&#8594;</div>
+                <div class="about-node"><h5>Outputs</h5><p>Unified analytics tables that power dashboard charts, drilldowns, and exportable tables.</p></div>
+                    <div class="about-arrow">&#8594;</div>
+                <div class="about-node"><h5>Planning Layer</h5><p>Template milestones + actual payment events roll into timeline and cashflow forecasts.</p></div>
+                </div>
+            </div>
         </div>
-    </div>
 
     <div class="about-rules">
         <div class="about-card">
-            <h4>Decision Tree: Agent Station Mapping</h4>
-            <div class="about-flow">
-                <div class="about-flow-row">
-                    <div class="about-node"><h5>Gate A</h5><p><strong>Is line_type == spend?</strong><br/>No: no station assignment<br/>Yes: continue</p></div>
-                    <div class="about-arrow">&#8594;</div>
-                    <div class="about-node"><h5>Gate B</h5><p><strong>Non-prod/pilot?</strong><br/>Route to non_prod/pilot buckets<br/>else continue</p></div>
-                    <div class="about-arrow">&#8594;</div>
-                    <div class="about-node"><h5>Gate C</h5><p><strong>CIP direct map available?</strong><br/><code>CIP-BF1-*</code> -> direct/prefix station mapping</p></div>
-                </div>
-                <div class="about-flow-row">
-                    <div class="about-node"><h5>Gate D</h5><p><strong>Tier-2 scored ranking</strong><br/>Build candidate set and sort by score; tie-break prefers matching line prefix family.</p></div>
-                    <div class="about-arrow">&#8594;</div>
-                    <div class="about-node"><h5>Guardrails + Status</h5><p>BASE2 requires explicit BASE2/BF2 project intent; then <code>apply_overrides()</code> sets final status (confirmed/skipped/non_prod/pilot_npi/auto/unmapped).</p></div>
-                </div>
-            </div>
+            <h4>Operator Runbook</h4>
+            <div class="about-timeline">
+                <div class="about-step"><div class="num">1</div><div class="body"><strong>Refresh data</strong>Run incremental refresh from <code>Settings &rarr; Data Management</code> before analysis sessions.</div></div>
+                <div class="about-step"><div class="num">2</div><div class="body"><strong>Verify coverage</strong>Check Executive Summary and Odoo vs Ramp splits for source balance and obvious anomalies.</div></div>
+                <div class="about-step"><div class="num">3</div><div class="body"><strong>Review classification</strong>Use <code>Classification Review</code> to accept/fix mismatches and improve future runs.</div></div>
+                <div class="about-step"><div class="num">4</div><div class="body"><strong>Maintain templates</strong>Keep <code>Milestone Templates</code> aligned to expected payment terms for major POs.</div></div>
+                <div class="about-step"><div class="num">5</div><div class="body"><strong>Publish forecast</strong>Use <code>Cashflow Forecast</code> + drilldowns and export snapshots for stakeholder reporting.</div></div>
         </div>
+    </div>
 
         <div class="about-card">
-            <h4>Real-Time Boundary Diagram</h4>
-            <div class="about-flow">
-                <div class="about-flow-row">
-                    <div class="about-node"><h5>Source Change</h5><p>New PO in Odoo or new Ramp transaction</p></div>
-                    <div class="about-arrow">&#8594;</div>
-                    <div class="about-node"><h5>Pending State</h5><p>No UI update until pipeline run occurs</p></div>
-                    <div class="about-arrow">&#8594;</div>
-                    <div class="about-node"><h5>Pipeline Run</h5><p>Batch pull + transform + export snapshot files</p></div>
-                    <div class="about-arrow">&#8594;</div>
-                    <div class="about-node"><h5>UI Visible</h5><p>Dashboard APIs reflect new snapshot immediately after export</p></div>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <div class="chart-card full" style="margin-top:14px">
-        <h3>Scoring and Bucketing Visuals</h3>
-        <div class="about-score-grid">
-            <div class="about-score-card">
-                <h4>Station Mapping Weights</h4>
-                <div class="about-bar-row">
-                    <div class="lbl">Vendor match (+3)</div>
-                    <div class="about-bar"><span style="width:100%"></span></div>
-                </div>
-                <div class="about-bar-row">
-                    <div class="lbl">Project-line match (+2)</div>
-                    <div class="about-bar"><span style="width:67%"></span></div>
-                </div>
-                <div class="about-bar-row">
-                    <div class="lbl">Keyword match (+1)</div>
-                    <div class="about-bar"><span style="width:34%"></span></div>
-                </div>
-                <div class="about-pill-row">
-                    <span class="about-pill ok">High >= 5</span>
-                    <span class="about-pill note">Medium >= 3</span>
-                    <span class="about-pill warn">Low >= 1</span>
-                </div>
-            </div>
-            <div class="about-score-card">
-                <h4>Subcategory Agent Priority (First Hit Wins)</h4>
-                <div class="about-flow-row">
-                    <div class="about-node"><h5>1</h5><p>Line override</p></div>
-                    <div class="about-arrow">&#8594;</div>
-                    <div class="about-node"><h5>2</h5><p>Vendor rules</p></div>
-                    <div class="about-arrow">&#8594;</div>
-                    <div class="about-node"><h5>3</h5><p>Keyword/project/card hints</p></div>
-                </div>
-                <div class="about-flow-row">
-                    <div class="about-node"><h5>4</h5><p>Category fallback</p></div>
-                    <div class="about-arrow">&#8594;</div>
-                    <div class="about-node"><h5>5</h5><p>Price heuristic</p></div>
-                    <div class="about-arrow">&#8594;</div>
-                    <div class="about-node"><h5>6</h5><p>Default bucket</p></div>
-                </div>
-            </div>
-            <div class="about-score-card">
-                <h4>Spares Bucket Priority</h4>
-                <div class="about-flow-row">
-                    <div class="about-node"><h5>Step A</h5><p>Description regex rules</p></div>
-                    <div class="about-arrow">&#8594;</div>
-                    <div class="about-node"><h5>Step B</h5><p>Category map fallback</p></div>
-                </div>
-                <div class="about-flow-row">
-                    <div class="about-node"><h5>Step C</h5><p>Capital threshold (>= 50k)</p></div>
-                    <div class="about-arrow">&#8594;</div>
-                    <div class="about-node"><h5>Step D</h5><p>Parts / Materials default</p></div>
-                </div>
-            </div>
-        </div>
+            <h4>Data Trust Model</h4>
+            <ul>
+                <li><strong>High confidence</strong>: raw identifiers, amounts, PO/vendor fields, and posted payment evidence.</li>
+                <li><strong>Medium confidence</strong>: mapped station/subcategory when rule signals are partial.</li>
+                <li><strong>Scenario confidence</strong>: projected cashflow from templates and expected dates.</li>
+                <li><strong>Control point</strong>: human edits and review decisions always take precedence over auto output.</li>
+            </ul>
         <details class="about-details">
-            <summary>Show technical scoring matrix</summary>
+                <summary>Show technical reference</summary>
             <div class="about-details-body">
                 <table class="about-tech-table">
                     <thead>
-                        <tr>
-                            <th>Engine</th>
-                            <th>Signal / Rule</th>
-                            <th>Weight / Priority</th>
-                            <th>Implementation Notes</th>
-                        </tr>
+                            <tr><th>Layer</th><th>Key logic</th><th>Purpose</th></tr>
                     </thead>
                     <tbody>
-                        <tr><td>Station Mapping</td><td>Vendor signal match</td><td>+3 score</td><td>Fuzzy vendor match from cost-breakdown vendors; constrained by line-family when project maps to a known line.</td></tr>
-                        <tr><td>Station Mapping</td><td>Project-to-line signal</td><td>+2 score</td><td>Project mapping adds candidates for allowed line prefixes.</td></tr>
-                        <tr><td>Station Mapping</td><td>Keyword signal</td><td>+1 score</td><td>Station keyword map + integration keywords add candidate boosts.</td></tr>
-                        <tr><td>Station Mapping</td><td>Confidence band</td><td>high >= 5, medium >= 3, low >= 1, none &lt; 1</td><td>Best-score station wins; tie-break favors matching project line prefix.</td></tr>
-                        <tr><td>Subcategory Agent</td><td>Priority chain</td><td>Ordered first-hit wins</td><td>line override -> split vendor -> specialist vendor -> distributor logic -> keywords -> project/card hints -> category fallback -> price heuristic -> default.</td></tr>
-                        <tr><td>Spares Bucket</td><td>Bucket priority</td><td>Regex -> category map -> threshold -> default</td><td><code>classify_item_bucket()</code> applies keyword rules first; unmatched rows fall back to category/price/default.</td></tr>
+                            <tr><td>Extract</td><td><span class="about-code">po_by_creators_last_7m.sql</span></td><td>Scoping by configured creators and recent date window.</td></tr>
+                            <tr><td>Cleanup</td><td><span class="about-code">step4_clean_odoo()</span></td><td>Standardized text/date/amount fields for consistent analytics.</td></tr>
+                            <tr><td>Mapping</td><td><span class="about-code">step7_map_stations()</span></td><td>Station assignment and confidence scoring.</td></tr>
+                            <tr><td>Overrides</td><td><span class="about-code">step8_apply_overrides()</span></td><td>Human corrections override auto mappings.</td></tr>
+                            <tr><td>Classification</td><td><span class="about-code">step9_classify_subcategories()</span></td><td>Manufacturing subcategory assignment.</td></tr>
+                            <tr><td>Export</td><td><span class="about-code">step10_export()</span></td><td>Materialized outputs used by dashboard APIs.</td></tr>
                     </tbody>
                 </table>
             </div>
         </details>
     </div>
-
-    <div class="chart-card full" style="margin-top:14px">
-        <h3>Concrete Example: Transaction Journey</h3>
-        <div class="about-journey">
-            <div class="about-stage">
-                <h5>Raw Input</h5>
-                <p>Odoo line enters with project <code>CIP-BF1-MOD1-ST22000</code>, vendor <code>Precitec</code>, and machinery description.</p>
-            </div>
-            <div class="about-connector">&#8594;</div>
-            <div class="about-stage">
-                <h5>Normalize</h5>
-                <p>Category/description split and numeric formatting produce clean fields for downstream mapping.</p>
-            </div>
-            <div class="about-connector">&#8594;</div>
-            <div class="about-stage">
-                <h5>Map Station</h5>
-                <p>CIP direct mapping assigns <code>BASE1-MOD1-ST22000</code> with high confidence.</p>
-            </div>
-            <div class="about-connector">&#8594;</div>
-            <div class="about-stage">
-                <h5>Classify</h5>
-                <p>Subcategory agent assigns manufacturing subcategory + confidence + reason fields.</p>
-            </div>
-            <div class="about-connector">&#8594;</div>
-            <div class="about-stage">
-                <h5>Bucket + Export</h5>
-                <p>Bucket logic labels catalog item, then row flows into clean/station/spares outputs.</p>
-            </div>
-        </div>
-        <details class="about-details">
-            <summary>Show field-level before/after details</summary>
-            <div class="about-details-body">
-                <table class="about-tech-table">
-                    <thead>
-                        <tr><th>Stage</th><th>Input / Rule Trigger</th><th>Output Fields</th></tr>
-                    </thead>
-                    <tbody>
-                        <tr><td>Raw Input</td><td><span class="about-code">project_name=CIP-BF1-MOD1-ST22000</span><span class="about-code">line_description=Non-Inventory: Machinery &gt;$2k TruFiber laser welding unit</span><span class="about-code">vendor_name=Precitec Inc.; price_subtotal=128500</span></td><td>Raw PO line from SQL extract.</td></tr>
-                        <tr><td>Normalization</td><td><span class="about-code">split_product_category(); _to_single_line(); _format_currency()</span></td><td><span class="about-code">product_category=Non-Inventory: Machinery &gt;$2k</span><span class="about-code">item_description=TruFiber laser welding unit</span><span class="about-code">price_subtotal=128500.00</span></td></tr>
-                        <tr><td>Station Mapping</td><td><span class="about-code">CIP-BF1-* -> BASE1-*</span></td><td><span class="about-code">station_id=BASE1-MOD1-ST22000</span><span class="about-code">mapping_confidence=high</span></td></tr>
-                        <tr><td>Subcategory Agent</td><td><span class="about-code">classify_mfg_subcategory()</span></td><td><span class="about-code">mfg_subcategory=Process Equipment</span><span class="about-code">subcat_reason=kw(...) or vendor=...</span></td></tr>
-                        <tr><td>Spares Bucketing</td><td><span class="about-code">classify_item_bucket()</span></td><td><span class="about-code">item_bucket=Capital Equipment</span></td></tr>
-                        <tr><td>Final Export</td><td><span class="about-code">step10_export()</span></td><td>Row contributes to <code>capex_clean.csv</code>, <code>capex_by_station.csv</code>, and <code>spares_catalog.csv</code>.</td></tr>
-                    </tbody>
-                </table>
-            </div>
-        </details>
-    </div>
-
-    <div class="chart-card full" style="margin-top:14px">
-        <h3>Rules Matrix (Specific Implementation)</h3>
-        <p style="font-size:12px;color:var(--muted);margin-bottom:8px">
-            Keep this collapsed for presentation mode; expand when you need exact implementation-level references.
-        </p>
-        <details class="about-details">
-            <summary>Show full rules matrix</summary>
-            <div class="about-details-body">
-                <table class="about-tech-table">
-                    <thead>
-                        <tr>
-                            <th>Layer</th>
-                            <th>Rule</th>
-                            <th>Behavior</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        <tr>
-                            <td>SQL Extract</td>
-                            <td>Creator Allowlist + 7-Month Window<span class="about-code">creators CTE; WHERE po.date_order &gt;= DATE_SUB(CURRENT_DATE(), INTERVAL 7 MONTH)</span></td>
-                            <td>Limits source scope to configured users and recent period only.</td>
-                        </tr>
-                        <tr>
-                            <td>SQL Extract</td>
-                            <td>Bill Dedup + Payment Rollup<span class="about-code">bill_links_dedup; bill_status_by_line</span></td>
-                            <td>Removes duplicate bill links and computes paid/partial/unpaid/mixed/no_bill states.</td>
-                        </tr>
-                        <tr>
-                            <td>Normalization</td>
-                            <td>Text/HTML/Locale Cleanup<span class="about-code">_to_single_line; _strip_html; _extract_en_us_name</span></td>
-                            <td>Converts multiline and rich text into clean analysis-ready strings.</td>
-                        </tr>
-                        <tr>
-                            <td>Normalization</td>
-                            <td>Money/Qty/Date Standardization<span class="about-code">_format_currency; _format_qty; _format_ts</span></td>
-                            <td>Enforces numeric/date consistency across Odoo and Ramp rows.</td>
-                        </tr>
-                        <tr>
-                            <td>Classification</td>
-                            <td>Line-Type + CAPEX Flag<span class="about-code">classify_line_type; tag_capex_flag</span></td>
-                            <td>Separates true spend lines from non-spend text/terms rows.</td>
-                        </tr>
-                        <tr>
-                            <td>Mapping</td>
-                            <td>3-Tier Station Assignment<span class="about-code">auto_map_stations</span></td>
-                            <td>Assigns station IDs using deterministic rules and score-based candidate ranking.</td>
-                        </tr>
-                        <tr>
-                            <td>Human Control</td>
-                            <td>Override Precedence<span class="about-code">apply_overrides; mapping_status field</span></td>
-                            <td>Human-confirmed routing overrides automatic mapping outputs.</td>
-                        </tr>
-                        <tr>
-                            <td>Export Integrity</td>
-                            <td>Spend-State Filter + Dedupe<span class="about-code">confirmed_states={'purchase','sent'}; drop_duplicates(subset=['line_id'])</span></td>
-                            <td>Keeps financially relevant spend rows and removes duplicate line artifacts.</td>
-                        </tr>
-                        <tr>
-                            <td>Forecast</td>
-                            <td>Station Override + Variance Math<span class="about-code">_load_forecast_overrides; variance = actual - forecast</span></td>
-                            <td>Applies per-station forecast overrides and recomputes variance metrics.</td>
-                        </tr>
-                        <tr>
-                            <td>Manual Entry</td>
-                            <td>Payload Validation + Upsert<span class="about-code">_validate_manual_payload; _upsert_manual_po</span></td>
-                            <td>Requires valid required fields/date/numeric values and deterministic manual IDs.</td>
-                        </tr>
-                    </tbody>
-                </table>
-            </div>
-        </details>
     </div>
 </div>
 
@@ -1147,12 +1170,13 @@ body.col-resize-active{cursor:col-resize;user-select:none}
         <div class="chart-card"><h3>Odoo PO Billing</h3><div id="chart-src-odoo-billing"></div></div>
         <div class="chart-card"><h3>Ramp CC Accounting</h3><div id="chart-src-ramp-billing"></div></div>
         <div class="chart-card full"><h3>Monthly Spend by Source</h3><div id="chart-source-monthly"></div></div>
+        <div class="chart-card full"><h3>Payment Evidence (PO-Level)</h3><div id="source-payment-evidence-wrap"></div></div>
     </div>
 </div>
 
 <!-- STATIONS -->
 <div class="page" id="page-stations">
-    <div class="page-header"><div><div class="page-title">Station Drill-Down</div><div class="page-subtitle">Select a station to view detailed spend and materials</div></div></div>
+    <div class="page-header"><div><div class="page-title">Station Drilldown</div><div class="page-subtitle">Select a station to view detailed spend and materials</div></div></div>
     <div class="filter-bar">
         <label>Station:</label>
         <select class="station-select" id="stationSelect" onchange="loadStationDetail()"></select>
@@ -1224,7 +1248,7 @@ body.col-resize-active{cursor:col-resize;user-select:none}
 
 <!-- SPARES -->
 <div class="page" id="page-spares">
-    <div class="page-header"><div><div class="page-title">Materials / Spares Catalog</div><div class="page-subtitle">Deduplicated items with part numbers and sourcing info</div></div></div>
+    <div class="page-header"><div><div class="page-title">Materials &amp; Spares Catalog</div><div class="page-subtitle">Deduplicated items with part numbers and sourcing info</div></div></div>
     <div class="filter-bar" id="spares-filters">
         <label>Bucket:</label><select id="sparesBucketFilter" onchange="filterSpares()"><option value="">All Buckets</option></select>
         <label>Station:</label><select id="sparesStationFilter" onchange="filterSpares()"><option value="">All Stations</option></select>
@@ -1238,7 +1262,9 @@ body.col-resize-active{cursor:col-resize;user-select:none}
 
 <!-- DETAIL -->
 <div class="page" id="page-detail">
-    <div class="page-header"><div><div class="page-title">Full Transaction Detail</div><div class="page-subtitle">All CAPEX line items from Odoo POs and Ramp credit card</div></div></div>
+    <div class="page-header"><div><div class="page-title">Full Transaction Detail</div><div class="page-subtitle">All CAPEX line items from Odoo POs and Ramp credit card</div></div>
+        <button id="btn-detail-expand" class="btn-refresh" style="width:auto;padding:8px 16px;background:var(--surface2);color:var(--text);border:1px solid var(--border)" onclick="toggleDetailExpand()">Expand Table</button>
+    </div>
     <div id="detail-table-wrap"></div>
 </div>
 
@@ -1279,17 +1305,371 @@ body.col-resize-active{cursor:col-resize;user-select:none}
     </div>
 </div>
 
+<!-- V2: CLASSIFICATION REVIEW QUEUE -->
+<div class="page" id="page-v2reviews">
+    <div class="page-header"><div><div class="page-title">Classification Review Queue</div><div class="page-subtitle">LLM disagreements with rule engine &mdash; sorted by dollar impact</div></div>
+        <div style="display:flex;gap:8px">
+            <button class="btn-refresh" style="width:auto;padding:8px 18px" onclick="triggerLLMReview()">Run LLM Review</button>
+            <button class="btn-refresh" style="width:auto;padding:8px 18px;background:var(--surface2);color:var(--text)" onclick="loadReviews()">Refresh</button>
+        </div>
+    </div>
+    <div class="kpi-row" id="review-kpis"></div>
+    <div class="chart-card full">
+        <h3>Pending Reviews <span id="review-count" style="font-size:12px;color:var(--muted);font-weight:400"></span></h3>
+        <div id="review-table-wrap" style="overflow-x:auto"></div>
+    </div>
+</div>
+
+<!-- V2: PAYMENT MILESTONES -->
+<div class="page" id="page-v2milestones">
+    <div class="page-header"><div><div class="page-title">Payment Timeline</div><div class="page-subtitle">PO payment timelines &mdash; from creation to final payment</div></div>
+        <button class="btn-refresh" style="width:auto;padding:8px 18px" onclick="loadMilestones()">Refresh</button>
+    </div>
+    <div class="kpi-row" id="milestone-kpis"></div>
+    <div id="milestone-note" style="margin:0 20px 12px;padding:10px 12px;background:var(--surface2);border:1px solid var(--border);border-radius:8px;font-size:11px;color:var(--muted)"></div>
+    <div class="chart-card full"><h3>PO Payment Timeline</h3><div id="chart-po-timeline" style="min-height:500px;max-height:80vh;overflow-y:auto"></div></div>
+    <div class="chart-card full"><h3>PO Payment Ledger (Raw Events)</h3><div id="vendor-profile-table-wrap" style="overflow-x:auto"></div></div>
+    <div class="chart-card full"><h3>Vendor Payment Profiles</h3><div id="line-profile-table-wrap" style="overflow-x:auto"></div></div>
+</div>
+
+<!-- V2: PAYMENT TEMPLATES -->
+<div class="page" id="page-v2templates">
+    <div class="page-header"><div><div class="page-title">Milestone Templates</div><div class="page-subtitle">Define payment milestone schedules per PO for cashflow projection</div></div>
+        <div style="display:flex;gap:8px">
+            <button class="btn-refresh" style="width:auto;padding:8px 18px;background:var(--surface2);color:var(--text)" onclick="showNewTemplateForm()">+ New Template</button>
+        </div>
+    </div>
+    <div id="gen-milestone-status" style="display:none;padding:8px 16px;margin-bottom:12px;font-size:12px;border-radius:6px;background:var(--surface2)"></div>
+    <div class="chart-card full">
+        <h3>Template Library <span id="template-count" style="font-size:12px;color:var(--muted);font-weight:400"></span></h3>
+        <div id="template-table-wrap" style="overflow-x:auto"></div>
+    </div>
+    <div class="chart-card full" id="template-editor" style="display:none">
+        <h3 id="template-editor-title">New Payment Template</h3>
+        <div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:16px;align-items:flex-end">
+            <div style="position:relative"><label style="font-size:11px;color:var(--muted)">Search PO (number, vendor, or buyer)</label><br>
+                <input class="forecast-input" id="tpl-po-search" style="width:360px" placeholder="Type to search..." oninput="filterPoList()" onfocus="document.getElementById('tpl-po-dropdown').style.display='block'">
+                <input type="hidden" id="tpl-po">
+                <div id="tpl-po-dropdown" style="display:none;position:absolute;top:100%;left:0;width:500px;max-height:280px;overflow-y:auto;background:var(--surface);border:1px solid var(--border);border-radius:8px;z-index:50;box-shadow:0 8px 24px rgba(0,0,0,.4);margin-top:2px"></div>
+            </div>
+            <div><label style="font-size:11px;color:var(--muted)">Vendor</label><br><input class="forecast-input" id="tpl-vendor" style="width:200px" readonly></div>
+            <div><label style="font-size:11px;color:var(--muted)">PO Total</label><br><input class="forecast-input" id="tpl-total" style="width:140px;font-weight:700;color:var(--green)" readonly></div>
+            <div><label style="font-size:11px;color:var(--muted)">Template Name</label><br><input class="forecast-input" id="tpl-name" style="width:200px" placeholder="e.g. Fanuc deposit schedule"></div>
+        </div>
+        <p style="font-size:12px;color:var(--muted);margin-bottom:12px">Define each payment milestone. Dollar amounts auto-calculate from PO total &times; percentage.</p>
+        <table style="width:100%;border-collapse:collapse;margin-bottom:8px" id="tpl-ms-table">
+            <thead><tr style="border-bottom:1px solid var(--border)">
+                <th style="text-align:left;padding:6px 8px;color:var(--muted);font-size:10px;text-transform:uppercase;width:160px">Milestone</th>
+                <th style="text-align:left;padding:6px 8px;color:var(--muted);font-size:10px;text-transform:uppercase;width:160px">Expected Date</th>
+                <th style="text-align:right;padding:6px 8px;color:var(--muted);font-size:10px;text-transform:uppercase;width:80px">% of PO</th>
+                <th style="text-align:right;padding:6px 8px;color:var(--muted);font-size:10px;text-transform:uppercase;width:110px">Amount</th>
+                <th style="width:40px"></th>
+            </tr></thead>
+            <tbody id="tpl-milestones"></tbody>
+            <tfoot><tr style="border-top:2px solid var(--border)">
+                <td style="padding:8px;font-weight:700;font-size:12px" colspan="2">Total</td>
+                <td style="padding:8px;text-align:right;font-weight:700;font-size:12px"><span id="tpl-pct-total">0</span>%</td>
+                <td style="padding:8px;text-align:right;font-weight:700;font-size:12px;color:var(--green)"><span id="tpl-amt-total">$0</span></td>
+                <td></td>
+            </tr></tfoot>
+        </table>
+        <button class="btn-refresh" style="width:auto;padding:6px 14px;background:var(--surface2);color:var(--text);font-size:12px" onclick="addMilestoneRow()">+ Add Milestone</button>
+        <div style="margin-top:16px;display:flex;gap:10px;align-items:center">
+            <button class="btn-refresh" style="width:auto;padding:10px 24px" onclick="saveTemplate()">Save Template</button>
+            <button class="btn-refresh" style="width:auto;padding:10px 24px;background:var(--surface2);color:var(--text)" onclick="hideTemplateEditor()">Cancel</button>
+            <span id="tpl-saved" class="forecast-saved" style="display:none">Template saved</span>
+        </div>
+    </div>
+</div>
+
+<!-- V2: AI RFQ GENERATOR -->
+<div class="page" id="page-airfq">
+    <div class="page-header"><div><div class="page-title">AI-RFQ Gen</div><div class="page-subtitle">Generate Odoo-ready RFQ CSV from vendor quote PDF with validation and preview</div></div>
+        <div style="display:flex;gap:8px">
+            <button class="btn-refresh" style="width:auto;padding:8px 18px;background:var(--surface2);color:var(--text)" onclick="loadAirRfq(true)">Refresh Lookups</button>
+        </div>
+    </div>
+    <div class="chart-grid">
+        <div class="chart-card">
+            <h3>Quote Inputs</h3>
+            <div style="display:grid;grid-template-columns:1fr;gap:10px">
+                <div>
+                    <label style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px">Vendor</label>
+                    <input class="forecast-input" id="airfq-vendor" list="airfq-vendors-list" placeholder="e.g. Balluff" style="width:100%">
+                    <datalist id="airfq-vendors-list"></datalist>
+                </div>
+                <div>
+                    <label style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px">Reference PO (optional)</label>
+                    <input class="forecast-input" id="airfq-reference-po" placeholder="e.g. PO11808" style="width:100%">
+                </div>
+                <div>
+                    <label style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px">Saved RFQs</label>
+                    <div style="display:flex;gap:8px;align-items:center">
+                        <select id="airfq-history-select" class="forecast-input" style="flex:1;min-width:0"></select>
+                        <button class="btn-refresh" style="width:auto;padding:8px 10px;background:var(--surface);color:var(--text);border:1px solid var(--border)" onclick="loadSelectedAirRfqHistory()">Load</button>
+                    </div>
+                </div>
+                <div>
+                    <label style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px">Quote PDF</label>
+                    <input id="airfq-pdf" type="file" accept=".pdf" style="width:100%;font-size:12px;color:var(--muted)">
+                </div>
+                <div>
+                    <label style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px">Prompt / Update Instructions</label>
+                    <textarea id="airfq-prompt" style="width:100%;height:140px;background:var(--surface2);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:10px;font-family:Consolas,monospace;font-size:12px;resize:vertical;line-height:1.45" placeholder="Describe RFQ intent. Example: Split into 3 lines qty 1 each and map to 3 different project codes."></textarea>
+                </div>
+                <div>
+                    <label style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px">Payment Milestones Note (optional)</label>
+                    <textarea id="airfq-payment-note" style="width:100%;height:70px;background:var(--surface2);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:10px;font-family:Consolas,monospace;font-size:12px;resize:vertical;line-height:1.4" placeholder="Example: 50% deposit with PO, 40% on FAT, 10% on SAT."></textarea>
+                </div>
+            </div>
+            <div style="margin-top:10px;padding:10px;border:1px solid var(--border);border-radius:8px;background:var(--surface2)">
+                <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px">Header Pickers (Lookup-backed)</div>
+                <div style="display:grid;grid-template-columns:repeat(3,minmax(180px,1fr));gap:8px">
+                    <div>
+                        <label style="font-size:10px;color:var(--muted)">Project</label>
+                        <input class="forecast-input" id="airfq-header-project" list="airfq-projects-list" placeholder="Select project" style="width:100%">
+                        <datalist id="airfq-projects-list"></datalist>
+                    </div>
+                    <div>
+                        <label style="font-size:10px;color:var(--muted)">Deliver To</label>
+                        <input class="forecast-input" id="airfq-header-deliver" list="airfq-deliver-list" placeholder="Select receiving operation" style="width:100%">
+                        <datalist id="airfq-deliver-list"></datalist>
+                    </div>
+                    <div>
+                        <label style="font-size:10px;color:var(--muted)">Default Tax (new/empty lines)</label>
+                        <input class="forecast-input" id="airfq-default-tax" list="airfq-taxes-list" placeholder="Select tax label" style="width:100%">
+                        <datalist id="airfq-taxes-list"></datalist>
+                    </div>
+                </div>
+                <div style="margin-top:8px">
+                    <button class="btn-refresh" style="width:auto;padding:8px 14px;background:var(--surface);color:var(--text);border:1px solid var(--border)" onclick="applyAirRfqHeaderEdits()">Apply Header Picks</button>
+                </div>
+            </div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">
+                <button class="btn-refresh" style="width:auto;padding:10px 16px" onclick="generateAirRfq(false)" id="btn-airfq-generate">AI Generate</button>
+                <button class="btn-refresh" style="width:auto;padding:10px 16px;background:var(--surface);color:var(--text);border:1px solid var(--border)" onclick="generateAirRfq(true)" id="btn-airfq-regenerate">Regenerate</button>
+                <button class="btn-refresh" style="width:auto;padding:10px 16px;background:var(--surface2);color:var(--text)" onclick="downloadAirRfqCsv()" id="btn-airfq-download" disabled>Download CSV</button>
+                <button class="btn-refresh" style="width:auto;padding:10px 16px;background:var(--surface2);color:var(--text)" onclick="resetAirRfqForm()">Reset</button>
+            </div>
+            <div id="airfq-status" style="margin-top:10px;font-size:11px;color:var(--muted);line-height:1.4"></div>
+        </div>
+        <div class="chart-card">
+            <h3>Validation Summary</h3>
+            <div id="airfq-validation" style="font-size:12px;color:var(--text);line-height:1.45"></div>
+            <div style="margin-top:12px;padding:10px;border:1px solid var(--border);border-radius:8px;background:var(--surface2)">
+                <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px">How to import CSV in Odoo</div>
+                <ol style="margin:0;padding-left:18px;font-size:12px;line-height:1.55;color:var(--text)">
+                    <li>Open <a href="https://erp.basepowercompany.com/odoo/purchase" target="_blank" rel="noopener" style="color:var(--green)">Odoo Purchase</a>.</li>
+                    <li>In <strong>Request for Quotation</strong>, click the gear icon (<strong>Actions</strong>).</li>
+                    <li>Select <strong>Import Records</strong>.</li>
+                    <li>Click <strong>Upload Data file</strong>.</li>
+                    <li>Browse and load your generated CSV.</li>
+                    <li>Click <strong>Test</strong> to validate data mapping.</li>
+                    <li>If test passes, click <strong>Import</strong>.</li>
+                </ol>
+            </div>
+        </div>
+        <div class="chart-card full">
+            <h3>Line Editor</h3>
+            <p style="font-size:11px;color:var(--muted);margin-bottom:8px">Edit line splits, quantities, projects, and taxes before import. Then click <strong>Apply Line Edits</strong>.</p>
+            <div style="margin-bottom:10px;padding:10px;border:1px solid var(--border);border-radius:8px;background:var(--surface2)">
+                <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px">Global Column Apply (all rows)</div>
+                <div style="display:grid;grid-template-columns:repeat(4,minmax(170px,1fr));gap:8px">
+                    <input class="forecast-input" id="airfq-bulk-product" placeholder="Product (overwrite all)">
+                    <input class="forecast-input" id="airfq-bulk-project" list="airfq-projects-list" placeholder="Project (overwrite all)">
+                    <input class="forecast-input" id="airfq-bulk-uom" placeholder="UoM (overwrite all)">
+                    <input class="forecast-input" id="airfq-bulk-tax" list="airfq-taxes-list" placeholder="Tax (overwrite all)">
+                    <input class="forecast-input" id="airfq-bulk-qty" type="number" step="0.01" min="0" placeholder="Qty (overwrite all)">
+                    <input class="forecast-input" id="airfq-bulk-price" type="number" step="0.01" min="0" placeholder="Unit price (overwrite all)">
+                    <input class="forecast-input" id="airfq-bulk-desc-prefix" placeholder="Description prefix (prepend)">
+                    <input class="forecast-input" id="airfq-bulk-desc-suffix" placeholder="Description suffix (append)">
+                </div>
+                <div style="margin-top:8px">
+                    <button class="btn-refresh" style="width:auto;padding:8px 14px;background:var(--surface);color:var(--text);border:1px solid var(--border)" onclick="applyAirRfqBulkEdits()">Apply Global to All Rows</button>
+                </div>
+            </div>
+            <div id="airfq-line-editor"></div>
+            <div style="margin-top:8px">
+                <button class="btn-refresh" style="width:auto;padding:8px 14px;background:var(--surface);color:var(--text);border:1px solid var(--border)" onclick="applyAirRfqLineEdits()">Apply Line Edits</button>
+            </div>
+        </div>
+        <div class="chart-card full">
+            <h3>RFQ Preview (Odoo-like)</h3>
+            <div id="airfq-preview"></div>
+        </div>
+        <div class="chart-card full">
+            <h3>Generated CSV</h3>
+            <textarea id="airfq-csv" readonly style="width:100%;height:220px;background:var(--surface2);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:10px;font-family:Consolas,monospace;font-size:11px;resize:vertical;line-height:1.35"></textarea>
+        </div>
+    </div>
+</div>
+
+<!-- V2: CASHFLOW PROJECTION -->
+<div class="page" id="page-v2cashflow">
+    <div class="page-header"><div><div class="page-title">Cashflow Forecast</div><div class="page-subtitle">Expected cash outflows &mdash; actual payments + projected from templates</div></div>
+        <div style="display:flex;gap:8px;align-items:center">
+            <label style="font-size:11px;color:var(--muted)">View</label>
+            <select id="cf-granularity" class="forecast-input" style="width:130px;text-align:left" onchange="loadCashflow()">
+                <option value="month" selected>Month</option>
+                <option value="workweek">Workweek</option>
+                <option value="quarter">Quarter</option>
+            </select>
+        </div>
+    </div>
+    <div class="kpi-row" id="cashflow-kpis"></div>
+    <div class="chart-grid">
+        <div class="chart-card full"><h3 id="cf-main-title">Monthly Cash Outflow</h3><div id="chart-cf-monthly" style="min-height:350px"></div></div>
+        <div class="chart-card full"><h3>Cumulative Spend Curve</h3><div id="chart-cf-cumulative" style="min-height:350px"></div></div>
+    </div>
+    <div class="chart-card full"><h3>Cashflow Event Ledger</h3><div id="cf-weekly-table-wrap" style="overflow-x:auto"></div></div>
+</div>
+
 <!-- SETTINGS -->
 <div class="page" id="page-settings">
-    <div class="page-header"><div><div class="page-title">Settings</div><div class="page-subtitle">Configure line capacities and floor area for unit economics calculations</div></div></div>
+    <div class="page-header"><div><div class="page-title">Settings</div><div class="page-subtitle">Configure pipeline, data sources, and line capacities</div></div></div>
+    <div class="chart-card" style="max-width:900px">
+        <h3>Access Control</h3>
+        <p id="settings-access-summary" style="font-size:12px;color:var(--muted);margin-bottom:12px">Loading access policy...</p>
+        <div style="display:grid;grid-template-columns:1fr;gap:12px">
+            <div>
+                <label style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px">Settings Owner (full control)</label>
+                <input id="settings-owner-email" type="email" style="width:100%;background:var(--surface2);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:10px 12px;font-size:12px" placeholder="owner@basepowercompany.com"/>
+            </div>
+            <div>
+                <label style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px">Settings Editors (one email per line)</label>
+                <textarea id="settings-editor-emails" style="width:100%;height:120px;background:var(--surface2);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:12px;font-family:monospace;font-size:12px;resize:vertical;line-height:1.5" placeholder="editor1@basepowercompany.com&#10;editor2@basepowercompany.com"></textarea>
+                <div style="font-size:11px;color:var(--muted);margin-top:6px">Editors can modify major settings and run data refresh/upload operations. Owner can also manage this access list.</div>
+            </div>
+        </div>
+    </div>
+    <div class="chart-card" style="max-width:900px">
+        <h3>Operations Automation</h3>
+        <p style="font-size:12px;color:var(--muted);margin-bottom:12px">Define the scheduler cadence and alert recipients used for cloud operations setup.</p>
+        <div style="display:grid;grid-template-columns:repeat(2,minmax(220px,1fr));gap:12px;margin-bottom:12px">
+            <div>
+                <label style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px">Daily Refresh Cron (UTC)</label>
+                <input id="settings-refresh-cron" type="text" style="width:100%;background:var(--surface2);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:10px 12px;font-size:12px" placeholder="0 8 * * *"/>
+            </div>
+            <div>
+                <label style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px">Scheduler Timezone</label>
+                <input id="settings-refresh-timezone" type="text" style="width:100%;background:var(--surface2);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:10px 12px;font-size:12px" placeholder="Etc/UTC"/>
+            </div>
+        </div>
+        <div>
+            <label style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px">Alert Emails (one per line)</label>
+            <textarea id="settings-alert-emails" style="width:100%;height:100px;background:var(--surface2);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:12px;font-family:monospace;font-size:12px;resize:vertical;line-height:1.5" placeholder="you@basepowercompany.com"></textarea>
+        </div>
+    </div>
+    <div class="chart-card" style="max-width:800px">
+        <h3>Data Management</h3>
+        <div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:16px">
+            <div style="flex:1;min-width:220px;background:var(--surface2);border-radius:8px;padding:16px">
+                <div style="font-size:13px;font-weight:600;margin-bottom:6px">Refresh from Odoo</div>
+                <p style="font-size:11px;color:var(--muted);margin-bottom:10px">Pull fresh PO + payment data from BigQuery and merge incrementally (preserves classifications).</p>
+                <button class="btn-refresh" style="width:100%;padding:10px" onclick="refreshFromOdoo()" id="btn-refresh-odoo">Refresh Data</button>
+                <div id="refresh-status" style="font-size:11px;color:var(--muted);margin-top:8px;display:none"></div>
+            </div>
+            <div style="flex:1;min-width:220px;background:var(--surface2);border-radius:8px;padding:16px">
+                <div style="font-size:13px;font-weight:600;margin-bottom:6px">Upload Ramp CSV</div>
+                <p style="font-size:11px;color:var(--muted);margin-bottom:10px">Upload a new Ramp export. Duplicates are skipped automatically; only new transactions are appended.</p>
+                <input type="file" id="ramp-csv-file" accept=".csv" style="font-size:11px;color:var(--muted);margin-bottom:8px;width:100%">
+                <button class="btn-refresh" style="width:100%;padding:10px;background:var(--surface);color:var(--text);border:1px solid var(--border)" onclick="uploadRampCsv()" id="btn-upload-ramp">Upload &amp; Append</button>
+                <div id="upload-status" style="font-size:11px;color:var(--muted);margin-top:8px;display:none"></div>
+            </div>
+            <div style="flex:1;min-width:220px;background:var(--surface2);border-radius:8px;padding:16px">
+                <div style="font-size:13px;font-weight:600;margin-bottom:6px">Manual PO Entry</div>
+                <p style="font-size:11px;color:var(--muted);margin-bottom:10px">Add or edit manual PO line items that aren't in Odoo or Ramp.</p>
+                <button class="btn-refresh" style="width:100%;padding:10px;background:var(--surface);color:var(--text);border:1px solid var(--border)" onclick="window.open('/api/v2/manual-po-redirect','_blank')">Open Manual PO Form</button>
+            </div>
+            <div style="flex:1;min-width:220px;background:var(--surface2);border-radius:8px;padding:16px">
+                <div style="font-size:13px;font-weight:600;margin-bottom:6px">AI Operations</div>
+                <p style="font-size:11px;color:var(--muted);margin-bottom:10px">Run AI tasks from settings. Milestone generation appends only new POs and preserves existing templates.</p>
+                <div style="display:flex;gap:8px;flex-direction:column">
+                    <button class="btn-refresh" style="width:100%;padding:10px" onclick="openClassificationReviewFromSettings()">Open Classification Review</button>
+                    <button class="btn-refresh" style="width:100%;padding:10px;background:var(--surface);color:var(--text);border:1px solid var(--border)" onclick="generateMilestoneTemplates()" id="btn-gen-milestones">Generate AI Milestones (Append New Only)</button>
+                </div>
+                <div id="gen-milestone-status-settings" style="display:none;font-size:11px;color:var(--muted);margin-top:8px"></div>
+            </div>
+        </div>
+    </div>
+    <div class="chart-card" style="max-width:800px">
+        <h3>PO Creator Names (Buyer Filter)</h3>
+        <p style="font-size:12px;color:var(--muted);margin-bottom:12px">These names control which POs are pulled from Odoo. Only POs created by people in this list are included in the dashboard. One name per line, case-insensitive.</p>
+        <textarea id="settings-creators" style="width:100%;height:200px;background:var(--surface2);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:12px;font-family:monospace;font-size:12px;resize:vertical;line-height:1.6" placeholder="Loading..."></textarea>
+        <div style="margin-top:8px;display:flex;gap:10px;align-items:center">
+            <span id="creator-count" style="font-size:12px;color:var(--muted)"></span>
+        </div>
+    </div>
+    <div class="chart-card" style="max-width:1000px">
+        <h3>Milestone AI Prompt Settings</h3>
+        <p style="font-size:12px;color:var(--muted);margin-bottom:12px">Control milestone generation behavior without code changes. Keep <code>{today}</code> in the system prompt; optional placeholders: <code>{program_context}</code>.</p>
+        <div style="display:grid;grid-template-columns:1fr;gap:12px">
+            <div>
+                <label style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px">Program Context (editable assumptions/schedule)</label>
+                <textarea id="settings-milestone-program-context" style="width:100%;height:140px;background:var(--surface2);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:12px;font-family:Consolas,monospace;font-size:12px;resize:vertical;line-height:1.5" placeholder="Example: Module 1 SOP window, Module 2 SOP window, INV1 SOP, supplier FAT/SAT dates"></textarea>
+            </div>
+            <div>
+                <label style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px">Milestone AI System Prompt Template</label>
+                <textarea id="settings-milestone-system-prompt" style="width:100%;height:260px;background:var(--surface2);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:12px;font-family:Consolas,monospace;font-size:12px;resize:vertical;line-height:1.5" placeholder="System prompt template used by the AI"></textarea>
+            </div>
+            <div>
+                <label style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px">Milestone AI User Prefix (optional)</label>
+                <textarea id="settings-milestone-user-prefix" style="width:100%;height:90px;background:var(--surface2);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:12px;font-family:Consolas,monospace;font-size:12px;resize:vertical;line-height:1.5" placeholder="Optional extra instruction prepended to each generation request"></textarea>
+            </div>
+        </div>
+    </div>
+    <div class="chart-card" style="max-width:1000px">
+        <h3>Classification AI Prompt Settings</h3>
+        <p style="font-size:12px;color:var(--muted);margin-bottom:12px">Use this only if you want stronger manufacturing context for station/sub-category classification. Optional placeholder in prompt: <code>{domain_context}</code>.</p>
+        <div style="display:grid;grid-template-columns:1fr;gap:12px">
+            <div>
+                <label style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px">Classification Domain Context</label>
+                <textarea id="settings-classification-domain-context" style="width:100%;height:170px;background:var(--surface2);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:12px;font-family:Consolas,monospace;font-size:12px;resize:vertical;line-height:1.5" placeholder="Base Power BF1 manufacturing context, line/station intent, and vendor patterns"></textarea>
+            </div>
+            <div>
+                <label style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px">Classification AI System Prompt Template</label>
+                <textarea id="settings-classification-system-prompt" style="width:100%;height:260px;background:var(--surface2);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:12px;font-family:Consolas,monospace;font-size:12px;resize:vertical;line-height:1.5" placeholder="System prompt template used by classification review AI"></textarea>
+            </div>
+        </div>
+    </div>
+    <div class="chart-card" style="max-width:1000px">
+        <h3>AI RFQ Prompt Settings</h3>
+        <p style="font-size:12px;color:var(--muted);margin-bottom:12px">These settings control PDF-to-RFQ generation, validation mode, and deterministic regeneration behavior.</p>
+        <div style="display:grid;grid-template-columns:repeat(2,minmax(240px,1fr));gap:12px;margin-bottom:12px">
+            <div>
+                <label style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px">RFQ AI Provider</label>
+                <select id="settings-rfq-provider" class="forecast-input" style="width:100%;text-align:left">
+                    <option value="gemini">gemini</option>
+                    <option value="openai">openai</option>
+                    <option value="anthropic">anthropic</option>
+                </select>
+            </div>
+            <div>
+                <label style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px">RFQ Validation Mode</label>
+                <select id="settings-rfq-validation-mode" class="forecast-input" style="width:100%;text-align:left">
+                    <option value="bq_only">bq_only (default)</option>
+                </select>
+            </div>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr;gap:12px">
+            <div>
+                <label style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px">RFQ AI User Prefix (optional)</label>
+                <textarea id="settings-rfq-user-prefix" style="width:100%;height:90px;background:var(--surface2);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:12px;font-family:Consolas,monospace;font-size:12px;resize:vertical;line-height:1.45" placeholder="Optional instruction prepended to each RFQ generation request"></textarea>
+            </div>
+            <div>
+                <label style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px">RFQ AI System Prompt Template</label>
+                <textarea id="settings-rfq-system-prompt" style="width:100%;height:260px;background:var(--surface2);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:12px;font-family:Consolas,monospace;font-size:12px;resize:vertical;line-height:1.5" placeholder="System prompt template used by AI-RFQ Gen"></textarea>
+            </div>
+        </div>
+    </div>
     <div class="chart-card" style="max-width:800px">
         <h3>Line Capacity &amp; Floor Area</h3>
         <p style="font-size:12px;color:var(--muted);margin-bottom:16px">Enter the GWh capacity and floor area (ft&sup2;) for each production line. These values are used to compute $/GWh and ft&sup2;/GWh metrics on the Unit Economics page.</p>
         <div id="settings-lines"></div>
-        <div style="margin-top:16px;display:flex;gap:10px;align-items:center">
-            <button class="btn-refresh" style="width:auto;padding:10px 24px" onclick="saveSettings()">Save Settings</button>
+    </div>
+    <div style="margin-top:16px;display:flex;gap:10px;align-items:center;padding:0 20px">
+        <button id="btn-save-settings" class="btn-refresh" style="width:auto;padding:10px 24px" onclick="saveSettings()">Save All Settings</button>
             <span id="settings-ok" class="forecast-saved" style="display:none">Settings saved</span>
-        </div>
     </div>
 </div>
 
@@ -1307,11 +1687,26 @@ body.col-resize-active{cursor:col-resize;user-select:none}
 <script>
 const C={green:'#B2DD79',greenBright:'#D0F585',red:'#D1531D',yellow:'#F7C33C',blue:'#048EE5',surface:'#242422',surface2:'#32312F',text:'#F0EEEB',muted:'#9E9C98',border:'#3E3D3A'};
 const PL={paper_bgcolor:C.surface,plot_bgcolor:C.surface,font:{color:C.text,size:11},xaxis:{gridcolor:C.surface2,zerolinecolor:C.surface2},yaxis:{gridcolor:C.surface2,zerolinecolor:C.surface2}};
-const PC={responsive:true,displayModeBar:false};
+const GRAPH_EXPORT_BUTTONS=[
+    {
+        name:'Export chart data as CSV',
+        icon:Plotly.Icons.disk,
+        click:function(gd){ exportGraphData(gd.id,'csv'); },
+    },
+    {
+        name:'Export chart data as Excel',
+        icon:Plotly.Icons.disk,
+        click:function(gd){ exportGraphData(gd.id,'xlsx'); },
+    },
+];
+const PC={responsive:true,displayModeBar:true,displaylogo:false,modeBarButtonsToAdd:GRAPH_EXPORT_BUTTONS};
 let dtI={}, summaryCache=null, sparesData=[];
+let detailTableExpanded=false;
+let detailExpandedRows=[], detailExpandedCols=[];
 let forecastOriginal={};
 let allModules=[], activeModules=new Set();
 const DEFAULT_UNCHECKED_LINES=new Set(['pilot / npi','needs review','non-prod']);
+const ENABLE_TABLE_COL_RESIZE=false;
 
 async function initLineFilter(){
     const res=await fetch('/api/modules');
@@ -1342,12 +1737,116 @@ function toggleAllLines(on){
     renderLineChecks();
     reloadCurrentPage();
 }
+function setTableExpand(on){
+    document.body.classList.toggle('tables-expanded',!!on);
+    const btn=document.getElementById('btn-table-expand');
+    if(btn){
+        btn.textContent=on?'Collapse Tables':'Expand Tables';
+        btn.style.borderColor=on?'var(--green)':'var(--border)';
+        btn.style.color=on?'var(--green)':'var(--text)';
+    }
+}
+function toggleTableExpand(){
+    const next=!document.body.classList.contains('tables-expanded');
+    setTableExpand(next);
+    localStorage.setItem('capex_tables_expanded',next?'1':'0');
+    Object.values(dtI).forEach(dt=>{try{dt.columns.adjust().draw(false);}catch(e){}});
+}
+function initUiPrefs(){
+    const expanded=localStorage.getItem('capex_tables_expanded')==='1';
+    setTableExpand(expanded);
+    detailTableExpanded=localStorage.getItem('capex_detail_expanded')==='1';
+    setDetailExpand(detailTableExpanded);
+}
+function setDetailExpand(on){
+    detailTableExpanded=!!on;
+    const wrap=document.getElementById('detail-table-wrap');
+    if(wrap)wrap.classList.toggle('detail-expanded',detailTableExpanded);
+    const btn=document.getElementById('btn-detail-expand');
+    if(btn){
+        btn.textContent=detailTableExpanded?'Collapse Table':'Expand Table';
+        btn.style.borderColor=detailTableExpanded?'var(--green)':'var(--border)';
+        btn.style.color=detailTableExpanded?'var(--green)':'var(--text)';
+    }
+}
+function toggleDetailExpand(){
+    const next=!detailTableExpanded;
+    setDetailExpand(next);
+    localStorage.setItem('capex_detail_expanded',next?'1':'0');
+    loadDetail();
+}
+function detailRowHtml(r){
+    let row='<tr>';
+    detailExpandedCols.forEach(c=>{
+        const v=r[c]!==undefined?r[c]:'';
+        if(c==='price_subtotal'||c==='price_total')row+=`<td class="dollar">${fmtF$(parseFloat(v)||0)}</td>`;
+        else if(c==='source')row+=`<td><span class="source-badge ${htmlEsc(v)}">${htmlEsc(v)}</span></td>`;
+        else row+=`<td>${htmlEsc(v)}</td>`;
+    });
+    row+='</tr>';
+    return row;
+}
+function applyDetailExpandedFilter(){
+    const input=document.getElementById('detail-native-search');
+    const q=(input&&input.value?input.value:'').trim().toLowerCase();
+    const rows=!q?detailExpandedRows:detailExpandedRows.filter(r=>detailExpandedCols.some(c=>String(r[c]??'').toLowerCase().includes(q)));
+    const body=document.getElementById('detail-native-body');
+    if(body)body.innerHTML=rows.map(detailRowHtml).join('');
+    const count=document.getElementById('detail-native-count');
+    if(count)count.textContent=`${rows.length.toLocaleString()} / ${detailExpandedRows.length.toLocaleString()} rows`;
+}
+function exportDetailExpandedCsv(){
+    const rows=detailExpandedRows.map(r=>{
+        const out={};
+        detailExpandedCols.forEach(c=>{out[c]=r[c]!==undefined?r[c]:'';});
+        return out;
+    });
+    const stamp=new Date().toISOString().slice(0,19).replace(/[:T]/g,'-');
+    downloadBlob(`capex_full_transactions_${stamp}.csv`,new Blob([rowsToCsv(rows)],{type:'text/csv;charset=utf-8;'}));
+    showToast('CSV export complete');
+}
+function exportDetailExpandedExcel(){
+    if(typeof XLSX==='undefined'){
+        showToast('Excel library unavailable');
+        return;
+    }
+    const rows=detailExpandedRows.map(r=>{
+        const out={};
+        detailExpandedCols.forEach(c=>{out[c]=r[c]!==undefined?r[c]:'';});
+        return out;
+    });
+    const stamp=new Date().toISOString().slice(0,19).replace(/[:T]/g,'-');
+    const wb=XLSX.utils.book_new();
+    const ws=XLSX.utils.json_to_sheet(rows.length?rows:[{info:'No rows'}]);
+    XLSX.utils.book_append_sheet(wb,ws,'full_transactions');
+    const out=XLSX.write(wb,{bookType:'xlsx',type:'array'});
+    downloadBlob(`capex_full_transactions_${stamp}.xlsx`,new Blob([out],{type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'}));
+    showToast('Excel export complete');
+}
+function renderDetailExpanded(data,cols,labels){
+    detailExpandedRows=Array.isArray(data)?data:[];
+    detailExpandedCols=[...cols];
+    let html='<div class="detail-native-toolbar"><div class="left">';
+    html+='<input id="detail-native-search" class="detail-native-search" type="text" placeholder="Search all columns..." oninput="applyDetailExpandedFilter()"/>';
+    html+='<button class="btn-refresh" style="width:auto;padding:8px 14px" onclick="exportDetailExpandedCsv()">CSV</button>';
+    html+='<button class="btn-refresh" style="width:auto;padding:8px 14px;background:var(--surface2);color:var(--text);border:1px solid var(--border)" onclick="exportDetailExpandedExcel()">Excel</button>';
+    html+='</div><div class="right" id="detail-native-count"></div></div>';
+    html+='<div class="detail-native-wrap"><table class="detail-native-table"><thead><tr>';
+    labels.forEach(l=>{html+=`<th>${htmlEsc(l)}</th>`;});
+    html+='</tr></thead><tbody id="detail-native-body"></tbody></table></div>';
+    document.getElementById('detail-table-wrap').innerHTML=html;
+    applyDetailExpandedFilter();
+}
 function lineQS(){
     if(activeModules.size===0)return'lines=__none__'; // None filter: show no data
     if(activeModules.size===allModules.length)return'';
     return'lines='+[...activeModules].join(',');
 }
-function apiUrl(path){const qs=lineQS();return qs?path+'?'+qs:path;}
+function apiUrl(path){
+    const qs=lineQS();
+    if(!qs)return path;
+    return path.includes('?') ? (path+'&'+qs) : (path+'?'+qs);
+}
 function reloadCurrentPage(){
     summaryCache=null;
     const active=document.querySelector('.page.active');
@@ -1363,22 +1862,68 @@ function reloadCurrentPage(){
     else if(id==='detail')loadDetail();
     else if(id==='timeline')loadTimeline();
     else if(id==='projects')loadProjects();
+    else if(id==='v2milestones')loadMilestones();
+    else if(id==='airfq')loadAirRfq();
+    else if(id==='v2cashflow')loadCashflow();
 }
 
 function fmt$(v){if(v==null||isNaN(v))return'$0';const a=Math.abs(v),s=v<0?'-':'';if(a>=1e6)return s+'$'+(a/1e6).toFixed(2)+'M';if(a>=1e3)return s+'$'+(a/1e3).toFixed(1)+'K';return s+'$'+a.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}
+function fmtMoney2(v){if(v==null||isNaN(v))return'$0.00';const n=Number(v)||0;const s=n<0?'-':'';const a=Math.abs(n);return s+'$'+a.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}
+function fmtDateMMDDYYYY(v){
+    if(!v)return'';
+    const d=new Date(v);
+    if(Number.isNaN(d.getTime()))return'';
+    const mm=String(d.getMonth()+1).padStart(2,'0');
+    const dd=String(d.getDate()).padStart(2,'0');
+    const yyyy=d.getFullYear();
+    return `${mm}/${dd}/${yyyy}`;
+}
+function htmlEsc(v){
+    return String(v??'')
+        .replace(/&/g,'&amp;')
+        .replace(/</g,'&lt;')
+        .replace(/>/g,'&gt;')
+        .replace(/"/g,'&quot;')
+        .replace(/'/g,'&#39;');
+}
 
 function dtOpts(base){
     const baseInit=base&&typeof base.initComplete==='function'?base.initComplete:null;
     return Object.assign({scrollX:true,autoWidth:false},base,{
         initComplete:function(){
             const api=this.api();
-            api.columns().every(function(){
-            const col=this;const th=$(col.footer());
-            if(!th.length)return;
-            $('<input type="text" placeholder="Filter..."/>').appendTo(th.empty()).on('keyup change',function(){if(col.search()!==this.value)col.search(this.value).draw();});
-            });
             const tableNode=api.table().node();
-            if(tableNode&&tableNode.id){
+            const thead=tableNode?tableNode.querySelector('thead'):null;
+            if(thead){
+                let filterRow=thead.querySelector('tr.dt-filter-row');
+                const headerCells=thead.querySelectorAll('tr:first-child th');
+                if(!filterRow){
+                    filterRow=document.createElement('tr');
+                    filterRow.className='dt-filter-row';
+                    for(let i=0;i<headerCells.length;i++){
+                        const th=document.createElement('th');
+                        th.innerHTML='<input type="text" placeholder="Filter..."/>';
+                        filterRow.appendChild(th);
+                    }
+                    thead.appendChild(filterRow);
+                }
+                api.columns().every(function(idx){
+                    const col=this;
+                    const input=filterRow.children[idx]?.querySelector('input');
+                    if(!input)return;
+                    input.onkeyup=input.onchange=function(){
+                        if(col.search()!==this.value)col.search(this.value).draw();
+                    };
+                });
+            }
+            if(!ENABLE_TABLE_COL_RESIZE&&tableNode){
+                const wrap=tableNode.closest('.dataTables_wrapper');
+                if(wrap){
+                    wrap.querySelectorAll('.col-resizer').forEach(el=>el.remove());
+                    wrap.querySelectorAll('table.dt-resizable').forEach(t=>t.classList.remove('dt-resizable'));
+                }
+            }
+            if(ENABLE_TABLE_COL_RESIZE&&tableNode&&tableNode.id){
                 enableTableColumnResize(api,tableNode.id);
                 if(!tableNode.dataset.resizeBound){
                     api.on('draw',()=>enableTableColumnResize(api,tableNode.id));
@@ -1399,7 +1944,8 @@ function enableTableColumnResize(dtApi,tableId){
     const bodyTable=wrap.querySelector('.dataTables_scrollBody table');
     if(!headTable||!bodyTable)return;
 
-    const headers=[...headTable.querySelectorAll('thead th')];
+    // Resize handles only belong on the primary header row (not filter row).
+    const headers=[...headTable.querySelectorAll('thead tr:first-child th')];
     if(!headers.length)return;
     headTable.classList.add('dt-resizable');
 
@@ -1412,17 +1958,12 @@ function enableTableColumnResize(dtApi,tableId){
         if(headCols[idx])headCols[idx].style.width=width+'px';
         if(bodyCols[idx])bodyCols[idx].style.width=width+'px';
         if(headers[idx])headers[idx].style.width=width+'px';
-        const n=idx+1;
-        headTable.querySelectorAll(`thead th:nth-child(${n})`).forEach(el=>{
-            el.style.width=width+'px';
-            el.style.minWidth=width+'px';
-            el.style.maxWidth=width+'px';
-        });
-        bodyTable.querySelectorAll(`thead th:nth-child(${n}), tbody td:nth-child(${n}), tfoot th:nth-child(${n})`).forEach(el=>{
-            el.style.width=width+'px';
-            el.style.minWidth=width+'px';
-            el.style.maxWidth=width+'px';
-        });
+        // Keep width assignment scoped to the target colgroup column only.
+        // Applying min/max widths to every cell causes cross-column resizing artifacts.
+        if(headers[idx]){
+            headers[idx].style.minWidth=width+'px';
+            headers[idx].style.maxWidth=width+'px';
+        }
     };
     const saveWidths=()=>{
         const payload=headers.map(h=>Math.round(h.getBoundingClientRect().width));
@@ -1457,14 +1998,6 @@ function enableTableColumnResize(dtApi,tableId){
             e.preventDefault();
             e.stopPropagation();
             startResize(e.clientX,th.getBoundingClientRect().width);
-        });
-        th.addEventListener('mousedown',(e)=>{
-            if(e.target!==th)return;
-            const rect=th.getBoundingClientRect();
-            if((rect.right-e.clientX)<=14){
-                e.preventDefault();
-                startResize(e.clientX,rect.width);
-            }
         });
         th.appendChild(handle);
     });
@@ -1624,6 +2157,89 @@ async function exportCurrentPage(format){
     }
 }
 
+function toPlainArray(v){
+    if(Array.isArray(v))return v;
+    if(v&&typeof v==='object'&&ArrayBuffer.isView(v))return Array.from(v);
+    return [];
+}
+function traceRows(trace, idx){
+    const tname=trace&&trace.name?String(trace.name):('trace_'+(idx+1));
+    const rows=[];
+    const x=toPlainArray(trace.x);
+    const y=toPlainArray(trace.y);
+    if(y.length||x.length){
+        const n=Math.max(y.length,x.length);
+        for(let i=0;i<n;i++){
+            rows.push({
+                trace:tname,
+                point_index:i,
+                x:(x[i]!==undefined?x[i]:i),
+                y:(y[i]!==undefined?y[i]:''),
+            });
+        }
+        return rows;
+    }
+    const labels=toPlainArray(trace.labels);
+    const values=toPlainArray(trace.values);
+    if(labels.length||values.length){
+        const n=Math.max(labels.length,values.length);
+        for(let i=0;i<n;i++){
+            rows.push({
+                trace:tname,
+                point_index:i,
+                label:(labels[i]!==undefined?labels[i]:''),
+                value:(values[i]!==undefined?values[i]:''),
+                parent:(toPlainArray(trace.parents)[i]!==undefined?toPlainArray(trace.parents)[i]:''),
+            });
+        }
+        return rows;
+    }
+    const z=Array.isArray(trace.z)?trace.z:[];
+    if(z.length&&Array.isArray(z[0])){
+        const hzX=toPlainArray(trace.x);
+        const hzY=toPlainArray(trace.y);
+        for(let yi=0;yi<z.length;yi++){
+            const row=z[yi];
+            for(let xi=0;xi<row.length;xi++){
+                rows.push({
+                    trace:tname,
+                    x:(hzX[xi]!==undefined?hzX[xi]:xi),
+                    y:(hzY[yi]!==undefined?hzY[yi]:yi),
+                    z:row[xi],
+                });
+            }
+        }
+        return rows;
+    }
+    return [{trace:tname,info:'No plottable arrays found in trace'}];
+}
+function exportGraphData(graphId,format){
+    const el=document.getElementById(graphId);
+    if(!el||!el.data||!el.data.length){
+        showToast('No chart data to export');
+        return;
+    }
+    const rows=[];
+    el.data.forEach((tr,idx)=>traceRows(tr,idx).forEach(r=>rows.push(r)));
+    const stamp=new Date().toISOString().slice(0,19).replace(/[:T]/g,'-');
+    const base='capex_'+safeFileName(graphId)+'_'+stamp;
+    if(format==='xlsx'){
+        if(typeof XLSX==='undefined'){
+            showToast('Excel library unavailable');
+            return;
+        }
+        const wb=XLSX.utils.book_new();
+        const ws=XLSX.utils.json_to_sheet(rows.length?rows:[{info:'No rows'}]);
+        XLSX.utils.book_append_sheet(wb,ws,safeSheetName(graphId));
+        const out=XLSX.write(wb,{bookType:'xlsx',type:'array'});
+        downloadBlob(base+'.xlsx',new Blob([out],{type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'}));
+        showToast('Graph exported to Excel');
+        return;
+    }
+    const csv=rowsToCsv(rows);
+    downloadBlob(base+'.csv',new Blob([csv],{type:'text/csv;charset=utf-8;'}));
+    showToast('Graph exported to CSV');
+}
 /* ====== DRILL-DOWN ====== */
 let drillDT=null;
 async function openDrill(title,params){
@@ -1632,7 +2248,7 @@ async function openDrill(title,params){
     const d=await res.json();
     document.getElementById('drill-title').textContent=title;
     document.getElementById('drill-sub').textContent=d.count+' items | '+fmtF$(d.total)+' total';
-    const cols=['source','po_number','date_order','vendor_name','mfg_subcategory','item_description','station_id','project_name','mapping_confidence','bill_payment_status','price_subtotal','created_by_name'];
+    const cols=['source','po_number','date_order','vendor_name','mfg_subcategory','item_description','station_id','project_name','mapping_confidence','payment_status_display','price_subtotal','created_by_name'];
     const labels=['Src','PO','Date','Vendor','Sub-Cat','Description','Station','Project','Conf','Pay','Subtotal','By'];
     let html='<table id="drill-tbl" class="display compact" style="width:100%"><thead><tr>';
     labels.forEach(l=>{html+='<th>'+l+'</th>';});
@@ -1640,9 +2256,11 @@ async function openDrill(title,params){
     labels.forEach(()=>{html+='<th></th>';});
     html+='</tr></tfoot><tbody>';
     (d.rows||[]).forEach(r=>{
+        const row={...r};
+        row.payment_status_display=(row.po_payment_status_v2||row.bill_payment_status||'');
         html+='<tr>';
         cols.forEach(c=>{
-            const v=r[c]!=null?r[c]:'';
+            const v=row[c]!=null?row[c]:'';
             if(c==='price_subtotal')html+='<td class="dollar">'+fmtF$(parseFloat(v)||0)+'</td>';
             else if(c==='source')html+='<td><span class="source-badge '+v+'">'+v+'</span></td>';
             else html+='<td>'+v+'</td>';
@@ -1662,13 +2280,28 @@ function closeDrill(){
     if(drillDT){drillDT.destroy();drillDT=null;}
 }
 
+function toggleSidebar(){
+    const sb=document.querySelector('.sidebar');
+    const ov=document.querySelector('.sidebar-overlay');
+    const open=sb.classList.toggle('open');
+    ov.classList.toggle('visible',open);
+    document.body.style.overflow=open?'hidden':'';
+}
+function closeSidebarIfMobile(){
+    if(window.innerWidth<=1024){
+        const sb=document.querySelector('.sidebar');
+        const ov=document.querySelector('.sidebar-overlay');
+        sb.classList.remove('open');
+        ov.classList.remove('visible');
+        document.body.style.overflow='';
+    }
+}
 function showPage(id,el){
     document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
     document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));
     document.getElementById('page-'+id).classList.add('active');
     if(el)el.classList.add('active');
-    const exportNote=document.getElementById('export-note');
-    if(exportNote)exportNote.textContent='Graphs + tables for '+id+' tab';
+    closeSidebarIfMobile();
     if(id==='about')loadAbout();
     if(id==='source')loadSource();
     if(id==='stations'&&!document.getElementById('stationSelect').value)loadStations();
@@ -1680,6 +2313,11 @@ function showPage(id,el){
     if(id==='timeline')loadTimeline();
     if(id==='projects')loadProjects();
     if(id==='uniteco')loadUnitEconomics();
+    if(id==='v2reviews')loadReviews();
+    if(id==='v2milestones')loadMilestones();
+    if(id==='v2templates')loadTemplates();
+    if(id==='airfq')loadAirRfq();
+    if(id==='v2cashflow')loadCashflow();
     if(id==='settings')loadSettings();
 }
 
@@ -1811,6 +2449,7 @@ async function loadExecutive(){
         ],{paper_bgcolor:C.surface,plot_bgcolor:C.surface,font:{color:C.text,size:11},height:Math.max(350,e.length*30),margin:{l:160,r:100,t:10,b:30},yaxis:{gridcolor:C.surface2,automargin:true},xaxis:{gridcolor:C.surface2,tickprefix:'$',tickformat:',.0s'}},PC);
         document.getElementById('chart-employees').on('plotly_click',function(ev){if(ev.points&&ev.points.length){const nm=ev.points[0].y;openDrill('Employee: '+nm,{employee:nm});}});
     }
+    loadPaymentEvidence('payment-evidence-wrap','payment-evidence-tbl');
 }
 
 /* ====== ODOO vs RAMP ====== */
@@ -1885,6 +2524,28 @@ async function loadSource(){
         ],{paper_bgcolor:C.surface,plot_bgcolor:C.surface,font:{color:C.text,size:11},barmode:'group',height:350,legend:{font:{color:C.muted},x:0,y:1.15,orientation:'h'},margin:{l:65,r:15,t:40,b:60},yaxis:{gridcolor:C.surface2,zerolinecolor:C.surface2,tickprefix:'$',tickformat:',.0s'},xaxis:{gridcolor:C.surface2}},PC);
         document.getElementById('chart-source-monthly').on('plotly_click',function(ev){if(ev.points&&ev.points.length){const p=ev.points[0];const src=p.data.name==='Ramp CC'?'ramp':'odoo';openDrill(p.x+' | '+p.data.name,{month:p.x,source:src});}});
     }
+    loadPaymentEvidence('source-payment-evidence-wrap','source-payment-evidence-tbl');
+}
+
+async function loadPaymentEvidence(wrapId,tableId){
+    const wrap=document.getElementById(wrapId);
+    if(!wrap)return;
+    const res=await fetch(apiUrl('/api/payment-evidence?limit=400'));
+    const d=await res.json();
+    const rows=d.rows||[];
+    if(!rows.length){
+        wrap.innerHTML='<p style="color:var(--muted);padding:20px">No payment evidence rows for current filter.</p>';
+        return;
+    }
+    let html='<table class="display compact" id="'+tableId+'" style="width:100%"><thead><tr><th>PO</th><th>Vendor</th><th>Buyer</th><th>Status</th><th>Confidence</th><th>PO Total</th><th>Paid</th><th>Open</th><th>Paid %</th><th>Signals</th><th>Evidence</th></tr></thead><tbody>';
+    rows.forEach(r=>{
+        const signals=[r.has_deposit_signal?'deposit':'',r.has_unbilled_signal?'unbilled_pay':'' ].filter(Boolean).join(', ')||'--';
+        html+=`<tr><td style="font-weight:700;color:var(--green)">${r.po_number||''}</td><td>${r.vendor_name||''}</td><td>${r.created_by_name||''}</td><td>${r.status_v2||''}</td><td>${r.confidence||''}</td><td style="text-align:right" data-order="${r.po_total||0}">${fmt$(r.po_total||0)}</td><td style="text-align:right" data-order="${r.paid_total_v2||0}">${fmt$(r.paid_total_v2||0)}</td><td style="text-align:right" data-order="${r.open_total_v2||0}">${fmt$(r.open_total_v2||0)}</td><td style="text-align:right" data-order="${r.paid_pct_of_po||0}">${(r.paid_pct_of_po||0).toFixed(1)}%</td><td>${signals}</td><td style="max-width:380px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${(r.evidence_notes||'').replace(/"/g,'&quot;')}">${r.evidence_notes||''}</td></tr>`;
+    });
+    html+='</tbody></table>';
+    wrap.innerHTML=html;
+    if(dtI[tableId])try{dtI[tableId].destroy();}catch(e){}
+    dtI[tableId]=$("#"+tableId).DataTable(dtOpts({pageLength:20,order:[[5,'desc']]}));
 }
 
 /* ====== STATIONS ====== */
@@ -2534,9 +3195,18 @@ function renderSpares(data){
 /* ====== DETAIL ====== */
 async function loadDetail(){
     const res=await fetch(apiUrl('/api/transactions'));const data=await res.json();
+    setDetailExpand(detailTableExpanded);
     if(!data.length){document.getElementById('detail-table-wrap').innerHTML='<p style="color:var(--muted)">No data.</p>';return;}
     const cols=['source','po_number','date_order','vendor_name','mfg_subcategory','item_description','station_id','mapping_confidence','price_subtotal','price_total','project_name','created_by_name'];
     const labels=['Source','PO','Date','Vendor','Sub-Category','Description','Station','Confidence','Subtotal','Total','Project','Created By'];
+    if(detailTableExpanded){
+        if(dtI['detail-tbl']){
+            try{dtI['detail-tbl'].destroy();}catch(e){}
+            dtI['detail-tbl']=null;
+        }
+        renderDetailExpanded(data,cols,labels);
+        return;
+    }
     let html='<table id="detail-tbl" class="display compact" style="width:100%"><thead><tr>';
     labels.forEach(l=>{html+=`<th>${l}</th>`;});
     html+='</tr></thead><tfoot><tr>';
@@ -2555,7 +3225,14 @@ async function loadDetail(){
     html+='</tbody></table>';
     document.getElementById('detail-table-wrap').innerHTML=html;
     if(dtI['detail-tbl'])dtI['detail-tbl'].destroy();
-    dtI['detail-tbl']=$('#detail-tbl').DataTable(dtOpts({pageLength:50,order:[[8,'desc']],dom:'Bfrtip',buttons:['csv','excel'],scrollX:true}));
+    dtI['detail-tbl']=$('#detail-tbl').DataTable(dtOpts({
+        pageLength:50,
+        order:[[8,'desc']],
+        dom:'Bfrtip',
+        buttons:['csv','excel'],
+        scrollX:true,
+        autoWidth:false
+    }));
 }
 
 /* ====== TIMELINE ====== */
@@ -2689,11 +3366,1155 @@ async function loadProjects(){
     }
 }
 
+/* ====== V2: CLASSIFICATION REVIEW QUEUE ====== */
+async function loadReviews(){
+    const res=await fetch('/api/v2/classification-reviews');const d=await res.json();
+    const reviews=d.reviews||[];
+    document.getElementById('review-count').textContent='('+reviews.length+' pending)';
+    document.getElementById('review-kpis').innerHTML=`
+        <div class="kpi"><div class="label">Pending Reviews</div><div class="value">${reviews.length}</div></div>
+        <div class="kpi"><div class="label">Total $ at Stake</div><div class="value dollar">${fmt$(reviews.reduce((s,r)=>s+(r.price_subtotal||0),0))}</div></div>`;
+    if(!reviews.length){
+        document.getElementById('review-table-wrap').innerHTML='<p style="color:var(--muted);padding:20px">No pending reviews. Run an LLM review to check classifications.</p>';
+        return;
+    }
+    const SUBCATS=['Process Equipment','Controls & Electrical','Mechanical & Structural','Consumables','MFG Tools & Shop Supplies','Design & Engineering Services','Integration & Commissioning','Quality & Metrology','Software & Licenses','Shipping & Freight','Facilities & Office','IT Equipment','General & Administrative'];
+    reviews.sort((a,b)=>(b.price_subtotal||0)-(a.price_subtotal||0));
+    let html='<table class="display" id="review-tbl" style="width:100%"><thead><tr><th>PO</th><th>PO Date</th><th>Vendor</th><th>Item Detail</th><th>Amount</th><th>Rule</th><th>LLM Suggestion</th><th>Actions</th></tr></thead><tbody>';
+    reviews.forEach((r,idx)=>{
+        const esc=s=>(s||'').replace(/'/g,"\\'").replace(/"/g,'&quot;');
+        const poInfo=`<span style="font-weight:600;color:var(--green)">${r.po_number||''}</span><br><span style="font-size:10px;color:var(--muted)">${r.source||'odoo'}</span>`;
+        const rawDate=(r.date_order||'').slice(0,10);
+        const sortDate=rawDate||'';
+        const itemDetail=`<div style="font-size:12px;max-width:300px"><div style="margin-bottom:2px" title="${esc(r.item_description)}">${r.item_description||''}</div><div style="font-size:10px;color:var(--muted)">Project: ${r.project_name||'--'}</div><div style="font-size:10px;color:var(--muted)">Category: ${r.product_category||'--'}</div></div>`;
+        const ruleInfo=`${r.rule_subcat||'?'}<br><span style="font-size:10px;color:var(--muted)">station: ${r.rule_station||'none'}</span><br><span style="font-size:10px;color:var(--muted)">${r.rule_mapping_status||''}</span>`;
+        const llmInfo=`<span style="color:var(--green);font-weight:600">${r.llm_subcat||'?'}</span><br><span style="font-size:10px;color:var(--muted)">station: ${r.llm_station||'none'}</span><br><span style="font-size:10px;color:var(--muted)">${r.llm_reasoning||''}</span>`;
+        html+=`<tr id="rv-row-${idx}">
+            <td style="font-size:12px">${poInfo}</td>
+            <td data-order="${sortDate}" style="font-size:12px;white-space:nowrap">${rawDate?fmtDateMMDDYYYY(rawDate):'--'}</td>
+            <td style="font-weight:600">${r.vendor_name||''}</td>
+            <td>${itemDetail}</td>
+            <td style="text-align:right" data-order="${r.price_subtotal||0}">${fmt$(r.price_subtotal||0)}</td>
+            <td style="font-size:12px">${ruleInfo}</td>
+            <td style="font-size:12px">${llmInfo}</td>
+            <td style="min-width:280px">
+                <div style="display:flex;gap:4px;margin-bottom:4px">
+                    <button onclick="submitReview('${r.review_id}','llm_accepted','${esc(r.llm_station)}','${esc(r.llm_subcat)}',${idx})" style="padding:4px 10px;background:var(--green);color:var(--accent-dark);border:none;border-radius:4px;font-size:11px;cursor:pointer;font-weight:700">Accept LLM</button>
+                    <button onclick="submitReview('${r.review_id}','rule_confirmed','${esc(r.rule_station)}','${esc(r.rule_subcat)}',${idx})" style="padding:4px 10px;background:var(--surface2);color:var(--text);border:none;border-radius:4px;font-size:11px;cursor:pointer">Keep Rule</button>
+                </div>
+                <div style="display:flex;gap:4px;align-items:center">
+                    <input class="forecast-input" id="rv-station-${idx}" placeholder="Station ID" value="${r.llm_station||r.rule_station||''}" style="width:130px;font-size:11px;padding:3px 6px">
+                    <select class="forecast-input" id="rv-subcat-${idx}" style="width:110px;font-size:11px;padding:3px 4px">
+                        ${SUBCATS.map(sc=>'<option'+(sc===(r.llm_subcat||r.rule_subcat)?' selected':'')+'>'+sc+'</option>').join('')}
+                    </select>
+                    <button onclick="submitOverride('${r.review_id}',${idx})" style="padding:3px 8px;background:var(--blue);color:white;border:none;border-radius:4px;font-size:11px;cursor:pointer;font-weight:600">Override</button>
+                </div>
+            </td></tr>`;
+    });
+    html+='</tbody></table>';
+    document.getElementById('review-table-wrap').innerHTML=html;
+    if(dtI['review-tbl'])dtI['review-tbl'].destroy();
+    dtI['review-tbl']=$('#review-tbl').DataTable(dtOpts({pageLength:25,order:[[1,'desc']],columnDefs:[{orderable:false,targets:7}]}));
+}
+async function submitReview(reviewId,decision,stationId,subcat,idx){
+    const row=document.getElementById('rv-row-'+idx);
+    const res=await fetch('/api/v2/classification-feedback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({review_id:reviewId,decision:decision,final_station_id:stationId,final_subcategory:subcat})});
+    const d=await res.json();
+    if(d.status==='ok'){row.style.opacity='0.3';row.style.pointerEvents='none';showToast('Feedback saved: '+decision);}
+}
+async function submitOverride(reviewId,idx){
+    const station=document.getElementById('rv-station-'+idx).value.trim();
+    const subcat=document.getElementById('rv-subcat-'+idx).value;
+    if(!subcat){showToast('Select a subcategory');return;}
+    const row=document.getElementById('rv-row-'+idx);
+    const res=await fetch('/api/v2/classification-feedback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({review_id:reviewId,decision:'human_override',final_station_id:station,final_subcategory:subcat})});
+    const d=await res.json();
+    if(d.status==='ok'){row.style.opacity='0.3';row.style.pointerEvents='none';showToast('Override saved: '+subcat+(station?' @ '+station:''));}
+}
+async function triggerLLMReview(){
+    showToast('Starting LLM review...');
+    const res=await fetch('/api/v2/run-classification-review',{method:'POST'});
+    const d=await res.json();
+    if(d.error){showToast('Error: '+d.error);return;}
+    showToast('Review complete: '+d.disagreements+' disagreements found');
+    loadReviews();
+}
+
+/* ====== V2: PAYMENT MILESTONES ====== */
+async function loadMilestones(){
+    const [tlRes,vpRes]=await Promise.all([fetch(apiUrl('/api/v2/po-timelines')),fetch(apiUrl('/api/v2/vendor-profiles'))]);
+    const tlData=await tlRes.json();const vpData=await vpRes.json();
+    const timelines=tlData.timelines||[];const profiles=vpData.profiles||[];
+
+    const withPay=timelines.filter(t=>t.payment_count>0);
+    const totalPaid=withPay.reduce((s,t)=>s+(t.total_paid||0),0);
+    const avgCycle=withPay.length?Math.round(withPay.reduce((s,t)=>s+(t.total_cycle_days||0),0)/withPay.length):0;
+
+    document.getElementById('milestone-kpis').innerHTML=`
+        <div class="kpi"><div class="label">POs with Payments</div><div class="value">${withPay.length}</div></div>
+        <div class="kpi"><div class="label">Total Paid</div><div class="value dollar">${fmt$(totalPaid)}</div></div>
+        <div class="kpi"><div class="label">Avg Payment Cycle</div><div class="value">${avgCycle} days</div></div>
+        <div class="kpi"><div class="label">Vendor Profiles</div><div class="value">${profiles.length}</div></div>`;
+    document.getElementById('milestone-note').innerHTML='All events shown here are <strong>actual observed payments</strong> from Odoo bill/payment history. "Final" is marked only when cumulative paid amount reaches the PO amount (with small tolerance); otherwise latest row is not final.';
+
+    if(withPay.length){
+        const allPOs=withPay.sort((a,b)=>(b.total_amount||0)-(a.total_amount||0));
+        const traces=[];
+        const MS_DAY=24*60*60*1000;
+        allPOs.forEach((t,i)=>{
+            const start=t.po_date?new Date(t.po_date):null;
+            if(!start)return;
+            const events=(t.milestones||[])
+                .filter(ms=>ms.label!=='PO Created'&&ms.date)
+                .sort((a,b)=>new Date(a.date)-new Date(b.date));
+            if(events.length>1){
+                traces.push({
+                    x:events.map(ms=>ms.date),
+                    y:events.map(()=>t.po_number+' ('+t.vendor_name+')'),
+                    mode:'lines',
+                    line:{color:'rgba(240,238,235,.24)',width:1},
+                    hoverinfo:'skip',
+                    showlegend:false,
+                });
+            }
+            events.forEach((ms,idx)=>{
+                if(ms.label==='PO Created')return;
+                const d=ms.date?new Date(ms.date):null;
+                if(!d)return;
+                const prev=idx>0?new Date(events[idx-1].date):(start||null);
+                const delta=(prev&&d)?Math.round((d-prev)/MS_DAY):null;
+                const toStart=(start&&d)?Math.round((d-start)/MS_DAY):null;
+                traces.push({
+                    x:[d],
+                    y:[t.po_number+' ('+t.vendor_name+')'],
+                    mode:'markers+text',
+                    text:[idx>0&&delta!=null?('→ '+delta+'d'):''],
+                    textposition:'top center',
+                    textfont:{size:9,color:C.muted},
+                    marker:{size:10,color:ms.label.includes('Deposit')?C.yellow:ms.label.includes('Final')?C.green:C.blue},
+                    name:ms.label,
+                    showlegend:false,
+                    hovertemplate:'%{y}<br>'+ms.label+'<br>Date: '+fmtDateMMDDYYYY(ms.date)+'<br>Amount: '+fmt$(ms.amount||0)+'<br>Since PO: '+(toStart==null?'--':toStart+' days')+'<br>Since prior payment: '+(delta==null?'--':delta+' days')+'<extra></extra>',
+                });
+            });
+        });
+        const chartH=Math.max(500,allPOs.length*30);
+        document.getElementById('chart-po-timeline').style.height=chartH+'px';
+        document.getElementById('chart-po-timeline').style.overflowY='auto';
+        Plotly.newPlot('chart-po-timeline',traces,{...PL,height:chartH,margin:{l:280,r:40,t:20,b:40},yaxis:{...PL.yaxis,autorange:'reversed'},xaxis:{...PL.xaxis,type:'date'}},{...PC,scrollZoom:true});
+        document.getElementById('chart-po-timeline').on('plotly_click',function(ev){
+            if(!ev.points||!ev.points.length)return;
+            const label=ev.points[0].y||'';
+            const po=label.split(' (')[0].trim();
+            if(po)openDrill('PO: '+po,{po:po});
+        });
+    } else {
+        document.getElementById('chart-po-timeline').innerHTML='<p style="color:var(--muted);padding:30px;text-align:center">No payment data yet. Run a full pipeline to pull payment details.</p>';
+    }
+
+    const paymentRows=[];
+    withPay.forEach(t=>{
+        const poDate=t.po_date?new Date(t.po_date):null;
+        const events=(t.milestones||[])
+            .filter(ms=>ms.label!=='PO Created'&&ms.date)
+            .sort((a,b)=>new Date(a.date)-new Date(b.date));
+        events.forEach((ms,idx)=>{
+            const d=ms.date?new Date(ms.date):null;
+            const prev=idx>0?new Date(events[idx-1].date):(poDate||null);
+            const daysSincePO=(poDate&&d)?Math.round((d-poDate)/(24*60*60*1000)):null;
+            const deltaPrev=(prev&&d)?Math.round((d-prev)/(24*60*60*1000)):null;
+            const amt=Number(ms.amount||0);
+            const poAmt=Number(t.total_amount||0);
+            const finalConfirmed=Boolean(ms.is_final_confirmed)||Boolean(t.is_final_confirmed&&idx===events.length-1&&poAmt>0);
+            paymentRows.push({
+                po_number:t.po_number||'',
+                vendor_name:t.vendor_name||'',
+                po_amount:poAmt,
+                payment_date:fmtDateMMDDYYYY(ms.date),
+                payment_date_sort:d&&!Number.isNaN(d.getTime())?d.toISOString().slice(0,10):'',
+                amount:amt,
+                pct_paid:poAmt?((amt/poAmt)*100):0,
+                days_since_po:daysSincePO,
+                delta_prev:idx===0?null:deltaPrev,
+                is_final:finalConfirmed,
+                label:ms.label||'Payment',
+            });
+        });
+    });
+    paymentRows.sort((a,b)=>{
+        if(a.po_number!==b.po_number)return String(a.po_number).localeCompare(String(b.po_number));
+        return String(a.payment_date_sort).localeCompare(String(b.payment_date_sort));
+    });
+    if(paymentRows.length){
+        let phtml='<table class="display" id="pm-raw-tbl" style="width:100%"><thead><tr><th>PO</th><th>Vendor</th><th>PO Amount</th><th>Payment Date</th><th>Amount</th><th>% of PO</th><th>Time Since PO</th><th>Δ vs Prior</th><th>Final?</th><th>Label</th></tr></thead><tbody>';
+        paymentRows.forEach(r=>{
+            phtml+=`<tr><td style="font-weight:700;color:var(--green)">${r.po_number}</td><td>${r.vendor_name}</td><td style="text-align:right" data-order="${r.po_amount}">${fmt$(r.po_amount)}</td><td data-order="${r.payment_date_sort||''}">${r.payment_date||'--'}</td><td style="text-align:right" data-order="${r.amount}">${fmt$(r.amount)}</td><td style="text-align:right" data-order="${r.pct_paid}">${r.pct_paid.toFixed(1)}%</td><td data-order="${r.days_since_po==null?-1:r.days_since_po}">${r.days_since_po==null?'--':r.days_since_po+' days'}</td><td data-order="${r.delta_prev==null?-1:r.delta_prev}">${r.delta_prev==null?'--':'→ '+r.delta_prev+' days'}</td><td>${r.is_final?'<span style="color:var(--green);font-weight:700">Yes</span>':'No'}</td><td>${r.label||''}</td></tr>`;
+        });
+        phtml+='</tbody></table>';
+        document.getElementById('vendor-profile-table-wrap').innerHTML=phtml;
+        if(dtI['pm-raw-tbl'])dtI['pm-raw-tbl'].destroy();
+        dtI['pm-raw-tbl']=$('#pm-raw-tbl').DataTable(dtOpts({pageLength:25,order:[[0,'asc'],[3,'asc']]}));
+    } else {
+        document.getElementById('vendor-profile-table-wrap').innerHTML='<p style="color:var(--muted);padding:20px">No raw payment events available for the current line filter.</p>';
+    }
+
+    if(profiles.length){
+        let vhtml='<table class="display" id="vp-tbl" style="width:100%"><thead><tr><th>Vendor</th><th>POs</th><th>Total Spend</th><th>Avg Cycle (days)</th><th>Avg Payments</th><th>Avg Deposit %</th></tr></thead><tbody>';
+        profiles.forEach(p=>{vhtml+=`<tr><td style="font-weight:600">${p.vendor_name}</td><td>${p.po_count}</td><td style="text-align:right" data-order="${p.total_spend}">${fmt$(p.total_spend)}</td><td>${p.avg_cycle_days}</td><td>${p.avg_payment_count}</td><td>${p.avg_deposit_pct}%</td></tr>`;});
+        vhtml+='</tbody></table>';
+        document.getElementById('line-profile-table-wrap').innerHTML=vhtml;
+        if(dtI['vp-tbl'])dtI['vp-tbl'].destroy();
+        dtI['vp-tbl']=$('#vp-tbl').DataTable(dtOpts({pageLength:12,order:[[2,'desc']]}));
+    } else {
+        document.getElementById('line-profile-table-wrap').innerHTML='<p style="color:var(--muted);padding:20px">No vendor profiles for this filter.</p>';
+    }
+}
+
+/* ====== V2: PAYMENT TEMPLATES ====== */
+function openClassificationReviewFromSettings(){
+    const nav=document.querySelector('.nav-item[onclick*="v2reviews"]');
+    showPage('v2reviews',nav||null);
+}
+async function generateMilestoneTemplates(){
+    if(!settingsAccess.can_edit_settings){
+        showToast('You do not have permission to run AI milestone generation');
+        return;
+    }
+    const btn=document.getElementById('btn-gen-milestones');
+    const statusMain=document.getElementById('gen-milestone-status');
+    const statusSettings=document.getElementById('gen-milestone-status-settings');
+    const setStatus=(msg,color)=>{
+        [statusMain,statusSettings].forEach(s=>{
+            if(!s)return;
+            s.style.display='block';
+            s.textContent=msg;
+            s.style.color=color;
+        });
+    };
+    btn.disabled=true;btn.textContent='Generating...';
+    setStatus('Running AI milestone generation for all $25K+ CAPEX POs. New POs will be appended only; existing templates are preserved.', 'var(--muted)');
+    try{
+        const res=await fetch('/api/v2/generate-milestones',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});
+        const d=await res.json();
+        if(d.error){setStatus('Error: '+d.error,'var(--red)');showToast('Generation failed');}
+        else{
+            const msg='Generated '+d.generated+' templates, saved '+d.saved+' new drafts';
+            setStatus(msg,'var(--green)');
+            showToast(msg);loadTemplates();
+        }
+    }catch(e){setStatus('Error: '+e.message,'var(--red)');}
+    btn.disabled=false;btn.textContent='Generate AI Milestones (Append New Only)';
+}
+let tplMilestoneCount=0,tplPoData=[];
+async function loadTemplates(){
+    const res=await fetch('/api/v2/payment-templates');const d=await res.json();
+    const templates=d.templates||[];
+    document.getElementById('template-count').textContent='('+templates.length+' templates)';
+    if(!templates.length){
+        document.getElementById('template-table-wrap').innerHTML='<p style="color:var(--muted);padding:20px">No templates yet. Click "+ New Template" to define payment milestones for a PO.</p>';
+        return;
+    }
+    window._tplCache=templates;
+    let html='<table class="display" id="tpl-tbl" style="width:100%"><thead><tr><th>PO</th><th>Vendor</th><th>PO Total</th><th>Name</th><th>Milestones</th><th>Actions</th></tr></thead><tbody>';
+    templates.forEach((t,idx)=>{
+        const ms=t.milestones||[];
+        const msList=(ms||[]).map(m=>{
+            const d=(m.expected_date||m.date||'').slice(0,10);
+            const s=m.status==='paid'?' <span style="color:var(--green);font-weight:700">[paid]</span>':'';
+            return `<li style="margin:2px 0">${m.label||'Milestone'} - ${Number(m.pct||0).toFixed(0)}% - ${d||'--'}${s}</li>`;
+        }).join('');
+        const msHtml=msList?`<ul style="margin:0;padding-left:16px;font-size:11px;line-height:1.35">${msList}</ul>`:'--';
+        const esc=s=>(s||'').replace(/'/g,"\\'");
+        html+=`<tr><td style="font-weight:600;color:var(--green)">${t.po_number||'--'}</td><td>${t.vendor_name||'--'}</td><td style="text-align:right" data-order="${t.total_amount||0}">${fmt$(t.total_amount||0)}</td><td style="font-size:12px">${t.name||''}<br><span style="font-size:10px;color:var(--muted)">${t.source==='ai_generated'?'AI draft':'manual'}</span></td><td style="font-size:11px;max-width:420px">${msHtml}</td><td style="white-space:nowrap"><button onclick="editTemplate(${idx})" style="padding:4px 10px;background:var(--green);color:var(--accent-dark);border:none;border-radius:4px;font-size:11px;cursor:pointer;font-weight:700">Edit</button> <button onclick="deleteTemplate('${esc(t.template_id)}')" style="padding:4px 10px;background:var(--surface2);color:var(--red);border:none;border-radius:4px;font-size:11px;cursor:pointer">Delete</button></td></tr>`;
+    });
+    html+='</tbody></table>';
+    document.getElementById('template-table-wrap').innerHTML=html;
+    if(dtI['tpl-tbl'])dtI['tpl-tbl'].destroy();
+    dtI['tpl-tbl']=$('#tpl-tbl').DataTable(dtOpts({pageLength:10,order:[[2,'desc']],columnDefs:[{targets:2,type:'num'},{orderable:false,targets:5}]}));
+}
+async function showNewTemplateForm(){
+    window._editingTemplateId=null;
+    document.getElementById('template-editor').style.display='block';
+    document.getElementById('template-editor-title').textContent='New Payment Template';
+    document.getElementById('tpl-name').value='';
+    document.getElementById('tpl-vendor').value='';
+    document.getElementById('tpl-total').value='';
+    document.getElementById('tpl-po').value='';
+    document.getElementById('tpl-po-search').value='';
+    tplMilestoneCount=0;
+    document.getElementById('tpl-milestones').innerHTML='';
+    updateTplTotals();
+    if(!tplPoData.length){
+        const res=await fetch('/api/v2/po-list');const d=await res.json();
+        tplPoData=d.pos||[];
+    }
+    document.addEventListener('click',e=>{
+        if(!e.target.closest('#tpl-po-search')&&!e.target.closest('#tpl-po-dropdown'))
+            document.getElementById('tpl-po-dropdown').style.display='none';
+    });
+}
+function filterPoList(){
+    const q=document.getElementById('tpl-po-search').value.toLowerCase().trim();
+    const dd=document.getElementById('tpl-po-dropdown');
+    if(!q||q.length<2){dd.innerHTML='<div style="padding:12px;color:var(--muted);font-size:12px">Type at least 2 characters...</div>';dd.style.display='block';return;}
+    const matches=tplPoData.filter(p=>{
+        const haystack=(p.po_number+' '+p.vendor_name+' '+(p.date_order||'')+' '+(p.station_id||'')+' '+(p.created_by_name||'')+' '+(p.project_name||'')).toLowerCase();
+        return haystack.includes(q);
+    }).slice(0,30);
+    if(!matches.length){dd.innerHTML='<div style="padding:12px;color:var(--muted);font-size:12px">No POs matching "'+q+'"</div>';dd.style.display='block';return;}
+    let html='';
+    matches.forEach(p=>{
+        const amt=Math.round(p.total_amount||0).toLocaleString();
+        html+=`<div onclick="selectPo('${p.po_number}','${(p.vendor_name||'').replace(/'/g,"\\'")}',${p.total_amount||0})" style="padding:8px 12px;cursor:pointer;border-bottom:1px solid var(--border);font-size:12px;display:flex;justify-content:space-between;align-items:center" onmouseenter="this.style.background='var(--surface2)'" onmouseleave="this.style.background=''">
+            <div><span style="font-weight:700;color:var(--green)">${p.po_number}</span> <span style="color:var(--muted)">|</span> ${(p.vendor_name||'').slice(0,30)}<br><span style="font-size:10px;color:var(--muted)">${(p.date_order||'').slice(0,10)} &bull; ${p.created_by_name||'?'} &bull; ${p.station_id||p.project_name||'no project'}</span></div>
+            <div style="font-weight:700;white-space:nowrap">$${amt}</div>
+        </div>`;
+    });
+    if(tplPoData.filter(p=>(p.po_number+' '+p.vendor_name).toLowerCase().includes(q)).length>30)
+        html+='<div style="padding:8px 12px;color:var(--muted);font-size:11px;text-align:center">Showing first 30 of more results...</div>';
+    dd.innerHTML=html;dd.style.display='block';
+}
+function selectPo(poNum,vendor,total){
+    document.getElementById('tpl-po').value=poNum;
+    document.getElementById('tpl-po-search').value=poNum+' - '+vendor;
+    document.getElementById('tpl-po-dropdown').style.display='none';
+    document.getElementById('tpl-vendor').value=vendor;
+    document.getElementById('tpl-total').value='$'+Math.round(total).toLocaleString();
+    document.getElementById('tpl-name').value=poNum+' milestones';
+    tplMilestoneCount=0;
+    document.getElementById('tpl-milestones').innerHTML='';
+    addMilestoneRow('Deposit','',30);
+    addMilestoneRow('Progress','',40);
+    addMilestoneRow('Final','',30);
+}
+function hideTemplateEditor(){document.getElementById('template-editor').style.display='none';}
+function addMilestoneRow(label,date,pct){
+    tplMilestoneCount++;
+    const tr=document.createElement('tr');
+    tr.style.borderBottom='1px solid rgba(62,61,58,.3)';
+    tr.innerHTML=`<td style="padding:6px 8px"><input class="forecast-input" value="${label||''}" placeholder="e.g. Deposit, Delivery, Final" style="width:100%;font-size:13px"></td>
+        <td style="padding:6px 8px"><input class="forecast-input" type="date" value="${date||''}" style="width:100%;font-size:13px"></td>
+        <td style="padding:6px 8px"><input class="forecast-input" type="number" value="${pct||0}" step="5" min="0" max="100" placeholder="%" style="width:100%;text-align:right;font-size:13px" oninput="updateTplTotals()"></td>
+        <td style="padding:6px 8px;text-align:right"><span class="ms-amt" style="font-size:13px;color:var(--green);font-weight:600">$0</span></td>
+        <td style="padding:6px 4px;text-align:center"><button onclick="this.closest('tr').remove();updateTplTotals()" style="background:none;color:var(--red);border:none;cursor:pointer;font-size:14px;font-weight:700;padding:2px 6px" title="Remove">&times;</button></td>`;
+    document.getElementById('tpl-milestones').appendChild(tr);
+    updateTplTotals();
+}
+function updateTplTotals(){
+    const totalStr=(document.getElementById('tpl-total').value||'').replace(/[$,]/g,'');
+    const poTotal=parseFloat(totalStr)||0;
+    let pctSum=0;
+    document.querySelectorAll('#tpl-milestones > tr').forEach(tr=>{
+        const inputs=tr.querySelectorAll('input');
+        const pct=parseFloat(inputs[2]?.value)||0;
+        const amt=poTotal*pct/100;
+        pctSum+=pct;
+        const amtSpan=tr.querySelector('.ms-amt');
+        if(amtSpan)amtSpan.textContent=fmt$(amt);
+    });
+    document.getElementById('tpl-pct-total').textContent=pctSum.toFixed(0);
+    document.getElementById('tpl-pct-total').style.color=Math.abs(pctSum-100)<1?'var(--green)':'var(--red)';
+    document.getElementById('tpl-amt-total').textContent=fmt$(poTotal*pctSum/100);
+}
+async function saveTemplate(){
+    const poNum=document.getElementById('tpl-po').value;
+    if(!poNum){showToast('Please select a PO first');return;}
+    const totalStr=(document.getElementById('tpl-total').value||'').replace(/[$,]/g,'');
+    const poTotal=parseFloat(totalStr)||0;
+    const milestones=[];
+    document.querySelectorAll('#tpl-milestones > tr').forEach(tr=>{
+        const inputs=tr.querySelectorAll('input');
+        if(inputs.length>=3&&inputs[0].value.trim()){
+            const pct=parseFloat(inputs[2].value)||0;
+            milestones.push({label:inputs[0].value.trim(),date:inputs[1].value||'',pct:pct,amount:Math.round(poTotal*pct/100*100)/100});
+        }
+    });
+    const totalPct=milestones.reduce((s,m)=>s+m.pct,0);
+    if(Math.abs(totalPct-100)>1){showToast('Milestone percentages must sum to ~100% (currently '+totalPct.toFixed(0)+'%)');return;}
+    const body={po_number:poNum,vendor_name:document.getElementById('tpl-vendor').value,total_amount:poTotal,name:document.getElementById('tpl-name').value.trim()||poNum+' milestones',milestones:milestones};
+    if(window._editingTemplateId)body.template_id=window._editingTemplateId;
+    const res=await fetch('/api/v2/payment-templates',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const d=await res.json();
+    if(d.status==='ok'){
+        document.getElementById('tpl-saved').style.display='inline';
+        setTimeout(()=>{document.getElementById('tpl-saved').style.display='none';},2500);
+        window._editingTemplateId=null;
+        showToast('Template saved for '+poNum);hideTemplateEditor();loadTemplates();
+    } else {showToast('Error: '+(d.error||'unknown'));}
+}
+function editTemplate(idx){
+    const t=window._tplCache[idx];
+    if(!t)return;
+    document.getElementById('template-editor').style.display='block';
+    document.getElementById('template-editor-title').textContent='Edit: '+t.po_number+' - '+(t.vendor_name||'').slice(0,25);
+    window._editingTemplateId=t.template_id;
+    document.getElementById('tpl-po').value=t.po_number||'';
+    document.getElementById('tpl-po-search').value=(t.po_number||'')+' - '+(t.vendor_name||'');
+    document.getElementById('tpl-vendor').value=t.vendor_name||'';
+    document.getElementById('tpl-total').value='$'+Math.round(t.total_amount||0).toLocaleString();
+    document.getElementById('tpl-name').value=t.name||'';
+    tplMilestoneCount=0;
+    document.getElementById('tpl-milestones').innerHTML='';
+    (t.milestones||[]).forEach(ms=>{
+        addMilestoneRow(ms.label,ms.expected_date||ms.date||'',ms.pct||0);
+    });
+    updateTplTotals();
+    document.getElementById('template-editor').scrollIntoView({behavior:'smooth'});
+}
+async function deleteTemplate(templateId){
+    if(!confirm('Delete this template?'))return;
+    const res=await fetch('/api/v2/payment-templates/'+encodeURIComponent(templateId),{method:'DELETE'});
+    const d=await res.json();
+    if(d.status==='ok'){showToast('Template deleted');loadTemplates();}
+    else{showToast('Error: '+(d.error||'unknown'));}
+}
+
+/* ====== V2: CASHFLOW PROJECTION ====== */
+async function loadCashflow(){
+    const res=await fetch(apiUrl('/api/v2/cashflow'));const d=await res.json();
+    const monthly=d.monthly||[];const cumul=d.cumulative||[];const weekly=d.weekly||[];
+    const gran=(document.getElementById('cf-granularity')?.value||'month');
+
+    document.getElementById('cashflow-kpis').innerHTML=`
+        <div class="kpi"><div class="label">Total Rows</div><div class="value">${d.total_rows||0}</div></div>
+        <div class="kpi"><div class="label">Actual Payments</div><div class="value">${d.actuals||0}</div></div>
+        <div class="kpi"><div class="label">Projected</div><div class="value">${d.projected||0}</div></div>
+        <div class="kpi"><div class="label">Line Filter</div><div class="value">${activeModules.size===allModules.length?'All':activeModules.size}</div></div>`;
+
+    if(!monthly.length){
+        document.getElementById('chart-cf-monthly').innerHTML='<p style="color:var(--muted);padding:30px;text-align:center">No cashflow data. Run a full pipeline and create payment templates.</p>';
+        document.getElementById('chart-cf-cumulative').innerHTML='';
+        document.getElementById('cf-weekly-table-wrap').innerHTML='';
+        return;
+    }
+
+    let labels=[],actuals=[],projected=[],mainTitle='Monthly Cash Outflow';
+    if(gran==='workweek'){
+        const wk=(weekly||[]).slice().sort((a,b)=>String(a.year_week||'').localeCompare(String(b.year_week||'')));
+        labels=wk.map(w=>w.year_week||'');
+        actuals=wk.map(w=>(w.items||[]).reduce((s,i)=>s+((i.source==='historical')?(i.amount||0):0),0));
+        projected=wk.map(w=>(w.items||[]).reduce((s,i)=>s+((i.source==='projected')?(i.amount||0):0),0));
+        mainTitle='Workweek Cash Outflow';
+    }else if(gran==='quarter'){
+        const qMap={};
+        (monthly||[]).forEach(m=>{
+            const mth=String(m.month||'');
+            const y=mth.slice(0,4);
+            const mm=parseInt(mth.slice(5,7),10);
+            const q=(Number.isFinite(mm)&&mm>=1&&mm<=12)?Math.floor((mm-1)/3)+1:1;
+            const key=`${y}-Q${q}`;
+            if(!qMap[key])qMap[key]={actual:0,projected:0};
+            qMap[key].actual+=(m.actual||0);
+            qMap[key].projected+=(m.projected||0);
+        });
+        labels=Object.keys(qMap).sort();
+        actuals=labels.map(k=>qMap[k].actual||0);
+        projected=labels.map(k=>qMap[k].projected||0);
+        mainTitle='Quarterly Cash Outflow';
+    }else{
+        labels=monthly.map(m=>m.month);
+        actuals=monthly.map(m=>m.actual);
+        projected=monthly.map(m=>m.projected);
+    }
+    document.getElementById('cf-main-title').textContent=mainTitle;
+
+    Plotly.newPlot('chart-cf-monthly',[
+        {x:labels,y:actuals,type:'bar',name:'Actual',marker:{color:C.green}},
+        {x:labels,y:projected,type:'bar',name:'Projected',marker:{color:C.blue,opacity:0.6}},
+    ],{...PL,barmode:'stack',height:350,margin:{l:70,r:20,t:20,b:60},yaxis:{...PL.yaxis,tickprefix:'$',tickformat:',.0s'},xaxis:{...PL.xaxis,tickangle:-30},legend:{x:0,y:1.1,orientation:'h',font:{size:11}}},PC);
+    document.getElementById('chart-cf-monthly').on('plotly_click',function(ev){
+        if(!ev.points||!ev.points.length)return;
+        if(gran!=='month'){showToast('Drill-down is available in Month view');return;}
+        openCashflowDrill(ev.points[0].x,'all');
+    });
+
+    const cMonths=[...labels];
+    const cActual=[];const cTotal=[];let runA=0;let runT=0;
+    for(let i=0;i<labels.length;i++){runA+=actuals[i]||0;runT+=(actuals[i]||0)+(projected[i]||0);cActual.push(runA);cTotal.push(runT);}
+    Plotly.newPlot('chart-cf-cumulative',[
+        {x:cMonths,y:cActual,mode:'lines+markers',name:'Cumulative Actual',line:{color:C.green,width:2},marker:{size:6}},
+        {x:cMonths,y:cTotal,mode:'lines+markers',name:'Cumulative Total',line:{color:C.blue,width:2,dash:'dot'},marker:{size:6}},
+    ],{...PL,height:350,margin:{l:70,r:20,t:20,b:60},yaxis:{...PL.yaxis,tickprefix:'$',tickformat:',.0s'},xaxis:{...PL.xaxis,tickangle:-30},legend:{x:0,y:1.1,orientation:'h',font:{size:11}}},PC);
+    document.getElementById('chart-cf-cumulative').on('plotly_click',function(ev){
+        if(!ev.points||!ev.points.length)return;
+        if(gran!=='month'){showToast('Drill-down is available in Month view');return;}
+        openCashflowDrill(ev.points[0].x,'all');
+    });
+
+    if(weekly.length){
+        const rows=[];
+        weekly.forEach(w=>{
+            (w.items||[]).forEach(i=>{
+                rows.push({
+                    week:w.year_week||'',
+                    po:i.po_number||'',
+                    vendor:i.vendor_name||'',
+                    line:i.line||'',
+                    milestone:i.milestone||'',
+                    date:(i.expected_date||'').slice(0,10),
+                    amount:parseFloat(i.amount||0),
+                    source:i.source||'',
+                });
+            });
+        });
+        let whtml='<table class="display" id="cf-weekly-tbl" style="width:100%"><thead><tr><th>Week</th><th>PO</th><th>Vendor</th><th>Line</th><th>Milestone</th><th>Date</th><th>Amount</th><th>Type</th></tr></thead><tbody>';
+        rows.forEach(r=>{
+            const type=r.source==='historical'?'Actual':'Projected';
+            whtml+=`<tr><td>${r.week}</td><td style="font-weight:700;color:var(--green)">${r.po}</td><td>${r.vendor}</td><td>${r.line||'--'}</td><td>${r.milestone}</td><td>${r.date||'--'}</td><td style="text-align:right" data-order="${r.amount}">${fmt$(r.amount)}</td><td>${type}</td></tr>`;
+        });
+        whtml+='</tbody></table>';
+        document.getElementById('cf-weekly-table-wrap').innerHTML=whtml;
+        if(dtI['cf-weekly-tbl'])dtI['cf-weekly-tbl'].destroy();
+        dtI['cf-weekly-tbl']=$('#cf-weekly-tbl').DataTable(dtOpts({pageLength:25,order:[[0,'desc'],[6,'desc']]}));
+    } else {
+        document.getElementById('cf-weekly-table-wrap').innerHTML='<p style="color:var(--muted);padding:20px">No cashflow ledger rows for this line filter.</p>';
+    }
+}
+
+/* ====== CASHFLOW DRILL-DOWN ====== */
+async function openCashflowDrill(month,source){
+    const res=await fetch(apiUrl('/api/v2/cashflow-drilldown?month='+encodeURIComponent(month)+'&source='+encodeURIComponent(source)));
+    const d=await res.json();
+    const items=d.items||[];
+    const title=month+(source==='all'?'':' ('+source+')');
+    const sub=items.length+' items, '+fmt$(items.reduce((s,i)=>s+(i.expected_amount||0),0));
+    document.getElementById('drill-title').textContent='Cashflow: '+title;
+    document.getElementById('drill-sub').textContent=sub;
+    if(!items.length){
+        document.getElementById('drill-body').innerHTML='<p style="color:var(--muted);padding:20px">No items for this month.</p>';
+    } else {
+        let html='<table class="display" id="cf-drill-tbl" style="width:100%"><thead><tr><th>PO</th><th>Vendor</th><th>Milestone</th><th>Date</th><th>Amount</th><th>Status</th></tr></thead><tbody>';
+        items.forEach(i=>{
+            let st='<span style="color:var(--blue)">Projected</span>';
+            if(i.source==='historical'){
+                if(i.record_type==='actual') st='<span style="color:var(--green)">Actual Paid</span>';
+                else if(i.record_type==='template') st='<span style="color:#B9770E">Template Paid</span>';
+                else st='<span style="color:var(--green)">Paid</span>';
+            }
+            html+=`<tr><td style="font-weight:600">${i.po_number||''}</td><td>${(i.vendor_name||'').slice(0,30)}</td><td>${i.milestone_label||''}</td><td>${(i.expected_date||'').slice(0,10)}</td><td style="text-align:right" data-order="${i.expected_amount||0}">${fmt$(i.expected_amount||0)}</td><td>${st}</td></tr>`;
+        });
+        html+='</tbody></table>';
+        document.getElementById('drill-body').innerHTML=html;
+        if(dtI['cf-drill-tbl'])try{dtI['cf-drill-tbl'].destroy();}catch(e){}
+        dtI['cf-drill-tbl']=$('#cf-drill-tbl').DataTable(dtOpts({pageLength:25,order:[[4,'desc']]}));
+    }
+    document.getElementById('drill-overlay').style.display='block';
+    document.getElementById('drill-panel').style.display='flex';
+}
+
+/* ====== DATA MANAGEMENT ====== */
+async function refreshFromOdoo(){
+    if(!settingsAccess.can_edit_settings){
+        showToast('You do not have permission to run refresh');
+        return;
+    }
+    const btn=document.getElementById('btn-refresh-odoo');
+    const status=document.getElementById('refresh-status');
+    btn.disabled=true;btn.textContent='Refreshing...';
+    status.style.display='block';status.textContent='Running incremental pipeline...';status.style.color='var(--muted)';
+    try{
+        const res=await fetch('/api/v2/refresh-data',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});
+        const d=await res.json();
+        if(d.error){status.textContent='Error: '+d.error;status.style.color='var(--red)';showToast('Refresh failed');}
+        else{
+            const msg=`Done: ${d.new||0} new, ${d.updated||0} updated, ${d.removed||0} removed`;
+            status.textContent=msg;status.style.color='var(--green)';
+            showToast(msg);
+        }
+    }catch(e){status.textContent='Error: '+e.message;status.style.color='var(--red)';}
+    btn.disabled=false;btn.textContent='Refresh Data';
+}
+async function uploadRampCsv(){
+    if(!settingsAccess.can_edit_settings){
+        showToast('You do not have permission to upload Ramp CSV');
+        return;
+    }
+    const fileInput=document.getElementById('ramp-csv-file');
+    const btn=document.getElementById('btn-upload-ramp');
+    const status=document.getElementById('upload-status');
+    if(!fileInput.files||!fileInput.files[0]){showToast('Select a CSV file first');return;}
+    const file=fileInput.files[0];
+    if(!file.name.toLowerCase().endsWith('.csv')){showToast('File must be a .csv');return;}
+    btn.disabled=true;btn.textContent='Uploading...';
+    status.style.display='block';status.textContent='Processing '+file.name+'...';status.style.color='var(--muted)';
+    try{
+        const form=new FormData();form.append('file',file);
+        const res=await fetch('/api/v2/upload-ramp-csv',{method:'POST',body:form});
+        const d=await res.json();
+        if(d.error){status.textContent='Error: '+d.error;status.style.color='var(--red)';showToast('Upload failed: '+d.error);}
+        else{
+            const msg=`Appended ${d.new_rows||0} new transactions (${d.skipped||0} duplicates skipped)`;
+            status.textContent=msg;status.style.color='var(--green)';
+            showToast(msg);fileInput.value='';
+        }
+    }catch(e){status.textContent='Error: '+e.message;status.style.color='var(--red)';}
+    btn.disabled=false;btn.textContent='Upload & Append';
+}
+
+/* ====== AI RFQ GEN ====== */
+let airfqState={revisionContext:null,csvText:'',csvFilename:'rfq_ai_generated.csv',lookupValues:{},lastValidation:null,lastPreview:null,historyItems:[],progressTimer:null,progressStartedAt:0,progressPhase:''};
+function setAirRfqStatus(msg,color){
+    const el=document.getElementById('airfq-status');
+    if(!el)return;
+    el.textContent=msg||'';
+    el.style.color=color||'var(--muted)';
+}
+function stopAirRfqProgress(){
+    if(airfqState.progressTimer){
+        clearInterval(airfqState.progressTimer);
+        airfqState.progressTimer=null;
+    }
+    airfqState.progressStartedAt=0;
+    airfqState.progressPhase='';
+}
+function startAirRfqProgress(phase){
+    stopAirRfqProgress();
+    airfqState.progressPhase=phase||'Generating';
+    airfqState.progressStartedAt=Date.now();
+    const tick=()=>{
+        const elapsed=Math.max(0,Math.floor((Date.now()-airfqState.progressStartedAt)/1000));
+        const p=airfqState.progressPhase||'Generating';
+        setAirRfqStatus(`${p} RFQ... ${elapsed}s elapsed (typical 15-60s depending on PDF and model).`,'var(--muted)');
+    };
+    tick();
+    airfqState.progressTimer=setInterval(tick,1000);
+}
+function csvEscape(v){
+    const s=String(v==null?'':v);
+    if(/[",\n]/.test(s))return '"'+s.replace(/"/g,'""')+'"';
+    return s;
+}
+function buildAirRfqCsvFromDraft(draft){
+    if(!draft||!draft.header||!Array.isArray(draft.lines))return '';
+    const headers=['External ID','Vendor','Vendor Reference','Order Deadline','Expected Arrival','Ask confirmation','Deliver To','Project','Terms and Conditions','Order Lines / Product','Order Lines / Display Type','Order Lines / Description','Order Lines / Project','Order Lines / Quantity','Order Lines / Unit of Measure','Order Lines / Unit Price','Order Lines / Taxes'];
+    const h=draft.header||{};
+    const externalId=(h.external_id||('rfq_ai_'+Math.random().toString(16).slice(2,10)));
+    const out=[headers.join(',')];
+    draft.lines.forEach(l=>{
+        const isNote=((l.display_type||'').toLowerCase()==='line_note')||String(l.description||'').toLowerCase().startsWith('payment:');
+        const taxes=Array.isArray(l.taxes)?l.taxes.filter(Boolean).join(','):(l.taxes||'');
+        const row=[
+            externalId,
+            h.vendor||'',
+            h.vendor_reference||'',
+            h.order_deadline||'',
+            h.expected_arrival||'',
+            Number(h.ask_confirmation?1:0),
+            h.deliver_to||'',
+            h.project||'',
+            h.terms_and_conditions||'',
+            isNote?'':(l.product||''),
+            isNote?'line_note':'',
+            l.description||'',
+            isNote?'':(l.project||''),
+            isNote?'':Number(l.quantity||0),
+            isNote?'':(l.uom||'Unit'),
+            isNote?'':Number(l.unit_price||0),
+            isNote?'':taxes,
+        ];
+        out.push(row.map(csvEscape).join(','));
+    });
+    return out.join('\n')+'\n';
+}
+function taxRateFromLabel(label){
+    const m=String(label||'').match(/(\d+(?:\.\d+)?)\s*%/);
+    if(!m)return 0;
+    return (parseFloat(m[1])||0)/100;
+}
+function buildAirRfqPreviewFromDraft(draft){
+    const h=draft?.header||{};
+    const lines=Array.isArray(draft?.lines)?draft.lines:[];
+    let untaxed=0,tax=0;
+    const pvLines=lines.map((l,idx)=>{
+        const isNote=((l.display_type||'').toLowerCase()==='line_note')||String(l.description||'').toLowerCase().startsWith('payment:');
+        const qty=Number(l.quantity||0);
+        const unit=Number(l.unit_price||0);
+        const subtotal=isNote?0:(qty*unit);
+        const taxLabel=Array.isArray(l.taxes)&&l.taxes.length?(l.taxes[0]||''):(l.taxes||'');
+        const rate=isNote?0:taxRateFromLabel(taxLabel);
+        const taxAmt=isNote?0:(subtotal*rate);
+        untaxed+=subtotal;tax+=taxAmt;
+        return{
+            line_no:idx+1,product:l.product||'',description:l.description||'',project:l.project||'',
+            display_type:isNote?'line_note':'',
+            quantity:qty,uom:l.uom||'Unit',unit_price:unit,tax_label:taxLabel,tax_rate:rate,
+            line_subtotal:subtotal,line_tax:taxAmt,line_total:subtotal+taxAmt,
+        };
+    });
+    return{
+        header:{
+            vendor:h.vendor||'',vendor_reference:h.vendor_reference||'',order_deadline:h.order_deadline||'',
+            expected_arrival:h.expected_arrival||'',ask_confirmation:Number(h.ask_confirmation?1:0),
+            deliver_to:h.deliver_to||'',project:h.project||'',terms_and_conditions:h.terms_and_conditions||'',
+        },
+        lines:pvLines,
+        totals:{untaxed_amount:untaxed,tax_amount:tax,total_amount:untaxed+tax},
+    };
+}
+function populateAirRfqLookupInputs(values){
+    const v=(values&&typeof values==='object')?values:{};
+    const vendors=Array.isArray(v.vendors)?v.vendors:[];
+    const projects=Array.isArray(v.projects)?v.projects:[];
+    const taxes=Array.isArray(v.taxes)?v.taxes:[];
+    const deliver=Array.isArray(v.deliver_to)?v.deliver_to:[];
+    const VENDOR_LIST_CAP=5000;
+    const PROJECT_LIST_CAP=20000;
+    const TAX_LIST_CAP=2000;
+    const DELIVER_LIST_CAP=1000;
+    const vendorList=document.getElementById('airfq-vendors-list');
+    if(vendorList)vendorList.innerHTML=vendors.slice(0,VENDOR_LIST_CAP).map(x=>`<option value="${htmlEsc(x)}"></option>`).join('');
+    const projList=document.getElementById('airfq-projects-list');
+    if(projList)projList.innerHTML=projects.slice(0,PROJECT_LIST_CAP).map(x=>`<option value="${htmlEsc(x)}"></option>`).join('');
+    const taxList=document.getElementById('airfq-taxes-list');
+    if(taxList)taxList.innerHTML=taxes.slice(0,TAX_LIST_CAP).map(x=>`<option value="${htmlEsc(x)}"></option>`).join('');
+    const delList=document.getElementById('airfq-deliver-list');
+    if(delList)delList.innerHTML=deliver.slice(0,DELIVER_LIST_CAP).map(x=>`<option value="${htmlEsc(x)}"></option>`).join('');
+}
+async function loadAirRfqHistory(){
+    try{
+        const res=await fetch('/api/v2/ai-rfq/history');
+        const d=await res.json();
+        const items=Array.isArray(d.items)?d.items:[];
+        airfqState.historyItems=items;
+        const sel=document.getElementById('airfq-history-select');
+        if(!sel)return;
+        let html='<option value="">Select previous RFQ...</option>';
+        items.slice(0,200).forEach(item=>{
+            const ts=(item.created_at||'').replace('T',' ').slice(0,19);
+            const vendor=item.vendor||'';
+            const csv=item.csv_filename||'';
+            const err=Number(item.blocking_error_count||0);
+            html+=`<option value="${htmlEsc(item.id||'')}">${htmlEsc(ts)} | ${htmlEsc(vendor)} | ${htmlEsc(csv)}${err>0?' | ERR':''}</option>`;
+        });
+        sel.innerHTML=html;
+    }catch(_e){
+        // non-blocking
+    }
+}
+async function loadSelectedAirRfqHistory(){
+    const sel=document.getElementById('airfq-history-select');
+    const id=(sel?.value||'').trim();
+    if(!id){showToast('Select a saved RFQ first');return;}
+    try{
+        const res=await fetch('/api/v2/ai-rfq/history/'+encodeURIComponent(id));
+        const d=await res.json();
+        if(d.error||!d.entry){showToast('Unable to load selected RFQ');return;}
+        const e=d.entry||{};
+        const vendor=(e.vendor||'').trim();
+        const prompt=(e.prompt||'').trim();
+        const paymentNote=(e.payment_milestones_note||'').trim();
+        const refPo=(e.meta&&e.meta.reference_po?String(e.meta.reference_po):'').trim();
+        const rev=e.revision_context||{};
+        const revObj=(rev&&typeof rev==='object')?rev:{};
+        if(!revObj.last_draft&&e.draft&&typeof e.draft==='object')revObj.last_draft=e.draft;
+        airfqState.revisionContext=Object.keys(revObj).length?revObj:null;
+        airfqState.csvText=e.csv_text||'';
+        airfqState.csvFilename=e.csv_filename||'rfq_ai_generated.csv';
+        airfqState.lastValidation=e.validation||{};
+        airfqState.lastPreview=e.preview||{};
+        const vIn=document.getElementById('airfq-vendor');if(vIn)vIn.value=vendor;
+        const pIn=document.getElementById('airfq-prompt');if(pIn)pIn.value=prompt;
+        const pm=document.getElementById('airfq-payment-note');if(pm)pm.value=paymentNote;
+        const rIn=document.getElementById('airfq-reference-po');if(rIn)rIn.value=refPo;
+        renderAirRfqValidation(airfqState.lastValidation||{});
+        refreshAirRfqDerivedViews();
+        setAirRfqStatus('Loaded saved RFQ from history.','var(--green)');
+    }catch(e){
+        setAirRfqStatus('History load error: '+e.message,'var(--red)');
+    }
+}
+function syncAirRfqHeaderPickers(draft){
+    const h=draft?.header||{};
+    const lines=Array.isArray(draft?.lines)?draft.lines:[];
+    const firstTax=(lines[0]&&Array.isArray(lines[0].taxes)&&lines[0].taxes.length)?lines[0].taxes[0]:'';
+    const p=document.getElementById('airfq-header-project');if(p)p.value=h.project||'';
+    const d=document.getElementById('airfq-header-deliver');if(d)d.value=h.deliver_to||'';
+    const t=document.getElementById('airfq-default-tax');if(t)t.value=firstTax||'';
+}
+function renderAirRfqLineEditor(draft){
+    const wrap=document.getElementById('airfq-line-editor');
+    if(!wrap)return;
+    const lines=Array.isArray(draft?.lines)?draft.lines:[];
+    if(!lines.length){
+        wrap.innerHTML='<p style="color:var(--muted);padding:12px">No lines available.</p>';
+        return;
+    }
+    let html='<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse" id="airfq-line-editor-tbl"><thead><tr style="border-bottom:1px solid var(--border)"><th style="padding:6px 4px;color:var(--muted);font-size:10px">#</th><th style="padding:6px 4px;color:var(--muted);font-size:10px">Type</th><th style="padding:6px 4px;color:var(--muted);font-size:10px">Product</th><th style="padding:6px 4px;color:var(--muted);font-size:10px">Description</th><th style="padding:6px 4px;color:var(--muted);font-size:10px">Project</th><th style="padding:6px 4px;color:var(--muted);font-size:10px">Qty</th><th style="padding:6px 4px;color:var(--muted);font-size:10px">UoM</th><th style="padding:6px 4px;color:var(--muted);font-size:10px">Unit Price</th><th style="padding:6px 4px;color:var(--muted);font-size:10px">Tax</th><th style="padding:6px 4px;color:var(--muted);font-size:10px"></th></tr></thead><tbody>';
+    lines.forEach((l,idx)=>{
+        const isNote=((l.display_type||'').toLowerCase()==='line_note')||String(l.description||'').toLowerCase().startsWith('payment:');
+        const tax=Array.isArray(l.taxes)&&l.taxes.length?l.taxes[0]:'';
+        html+=`<tr data-line-idx="${idx}" data-display-type="${isNote?'line_note':''}" style="border-bottom:1px solid rgba(62,61,58,.3)">
+            <td style="padding:6px 4px">${idx+1}</td>
+            <td style="padding:6px 4px;color:${isNote?'var(--yellow)':'var(--muted)'}">${isNote?'Note':'Spend'}</td>
+            <td style="padding:6px 4px"><input class="forecast-input airfq-li-product" value="${htmlEsc(l.product||'')}" style="width:220px" ${isNote?'disabled':''}></td>
+            <td style="padding:6px 4px"><input class="forecast-input airfq-li-desc" value="${htmlEsc(l.description||'')}" style="width:260px"></td>
+            <td style="padding:6px 4px"><input class="forecast-input airfq-li-project" list="airfq-projects-list" value="${htmlEsc(l.project||'')}" style="width:260px" ${isNote?'disabled':''}></td>
+            <td style="padding:6px 4px"><input class="forecast-input airfq-li-qty" type="number" step="0.01" min="0" value="${Number(l.quantity||0)}" style="width:90px;text-align:right" ${isNote?'disabled':''}></td>
+            <td style="padding:6px 4px"><input class="forecast-input airfq-li-uom" value="${htmlEsc(l.uom||'Unit')}" style="width:90px" ${isNote?'disabled':''}></td>
+            <td style="padding:6px 4px"><input class="forecast-input airfq-li-price" type="number" step="0.01" min="0" value="${Number(l.unit_price||0)}" style="width:110px;text-align:right" ${isNote?'disabled':''}></td>
+            <td style="padding:6px 4px"><input class="forecast-input airfq-li-tax" list="airfq-taxes-list" value="${htmlEsc(tax||'')}" style="width:220px" ${isNote?'disabled':''}></td>
+            <td style="padding:6px 4px"><button style="padding:4px 8px;background:var(--surface2);color:var(--red);border:1px solid var(--border);border-radius:4px;cursor:pointer" onclick="removeAirRfqLine(${idx})">Remove</button></td>
+        </tr>`;
+    });
+    html+='</tbody></table></div>';
+    html+='<div style="margin-top:8px"><button class="btn-refresh" style="width:auto;padding:6px 12px;background:var(--surface2);color:var(--text)" onclick="addAirRfqLine()">+ Add Line</button></div>';
+    wrap.innerHTML=html;
+}
+function refreshAirRfqDerivedViews(){
+    const draft=airfqState.revisionContext?.last_draft;
+    if(!draft)return;
+    airfqState.csvText=buildAirRfqCsvFromDraft(draft);
+    airfqState.lastPreview=buildAirRfqPreviewFromDraft(draft);
+    document.getElementById('airfq-csv').value=airfqState.csvText||'';
+    renderAirRfqPreview(airfqState.lastPreview||{});
+    renderAirRfqLineEditor(draft);
+    syncAirRfqHeaderPickers(draft);
+    const btnDownload=document.getElementById('btn-airfq-download');
+    if(btnDownload)btnDownload.disabled=!airfqState.csvText;
+}
+function applyAirRfqHeaderEdits(){
+    const draft=airfqState.revisionContext?.last_draft;
+    if(!draft||!draft.header){showToast('Generate RFQ first');return;}
+    const project=(document.getElementById('airfq-header-project').value||'').trim();
+    const deliver=(document.getElementById('airfq-header-deliver').value||'').trim();
+    const defaultTax=(document.getElementById('airfq-default-tax').value||'').trim();
+    if(project)draft.header.project=project;
+    if(deliver)draft.header.deliver_to=deliver;
+    if(Array.isArray(draft.lines)){
+        draft.lines=draft.lines.map(l=>{
+            const next={...l};
+            const isNote=((next.display_type||'').toLowerCase()==='line_note')||String(next.description||'').toLowerCase().startsWith('payment:');
+            if(!isNote&&!next.project)next.project=draft.header.project||'';
+            if(!isNote&&defaultTax&&(!Array.isArray(next.taxes)||!next.taxes.length))next.taxes=[defaultTax];
+            return next;
+        });
+    }
+    refreshAirRfqDerivedViews();
+    setAirRfqStatus('Applied header edits locally. Click Regenerate to re-run AI with context if needed.','var(--green)');
+}
+function applyAirRfqLineEdits(){
+    const draft=airfqState.revisionContext?.last_draft;
+    if(!draft){showToast('Generate RFQ first');return;}
+    const rows=[...document.querySelectorAll('#airfq-line-editor-tbl tbody tr[data-line-idx]')];
+    if(!rows.length){showToast('No editable lines found');return;}
+    const lines=[];
+    rows.forEach(r=>{
+        const isNote=((r.getAttribute('data-display-type')||'').toLowerCase()==='line_note');
+        const product=(r.querySelector('.airfq-li-product')?.value||'').trim();
+        const desc=(r.querySelector('.airfq-li-desc')?.value||'').trim();
+        const project=(r.querySelector('.airfq-li-project')?.value||'').trim()||(draft.header?.project||'');
+        const qty=parseFloat((r.querySelector('.airfq-li-qty')?.value||'0'))||0;
+        const uom=(r.querySelector('.airfq-li-uom')?.value||'Unit').trim()||'Unit';
+        const price=parseFloat((r.querySelector('.airfq-li-price')?.value||'0'))||0;
+        const tax=(r.querySelector('.airfq-li-tax')?.value||'').trim();
+        if(!product&&!desc)return;
+        if(isNote){
+            lines.push({product:'',description:desc||'Payment: note',project:'',display_type:'line_note',quantity:0,uom:'',unit_price:0,taxes:[]});
+            return;
+        }
+        lines.push({product:product||'Non-Inventory: Construction in Process',description:desc||'RFQ line',project,display_type:'',quantity:qty>0?qty:1,uom,unit_price:price>=0?price:0,taxes:tax?[tax]:[]});
+    });
+    if(!lines.length){showToast('At least one line is required');return;}
+    draft.lines=lines;
+    refreshAirRfqDerivedViews();
+    setAirRfqStatus('Applied line edits locally. You can download CSV or click Regenerate for AI refinement.','var(--green)');
+}
+function applyAirRfqBulkEdits(){
+    const draft=airfqState.revisionContext?.last_draft;
+    if(!draft||!Array.isArray(draft.lines)||!draft.lines.length){showToast('Generate RFQ first');return;}
+    const bulkProduct=(document.getElementById('airfq-bulk-product')?.value||'').trim();
+    const bulkProject=(document.getElementById('airfq-bulk-project')?.value||'').trim();
+    const bulkUom=(document.getElementById('airfq-bulk-uom')?.value||'').trim();
+    const bulkTax=(document.getElementById('airfq-bulk-tax')?.value||'').trim();
+    const bulkQtyRaw=(document.getElementById('airfq-bulk-qty')?.value||'').trim();
+    const bulkPriceRaw=(document.getElementById('airfq-bulk-price')?.value||'').trim();
+    const descPrefix=(document.getElementById('airfq-bulk-desc-prefix')?.value||'').trim();
+    const descSuffix=(document.getElementById('airfq-bulk-desc-suffix')?.value||'').trim();
+    const hasQty=bulkQtyRaw!=='';
+    const hasPrice=bulkPriceRaw!=='';
+    const bulkQty=hasQty?(parseFloat(bulkQtyRaw)||0):null;
+    const bulkPrice=hasPrice?(parseFloat(bulkPriceRaw)||0):null;
+    let touched=0;
+    draft.lines=draft.lines.map(line=>{
+        const next={...(line||{})};
+        const isNote=((next.display_type||'').toLowerCase()==='line_note')||String(next.description||'').toLowerCase().startsWith('payment:');
+        if(isNote)return next;
+        if(bulkProduct){next.product=bulkProduct;touched++;}
+        if(bulkProject){next.project=bulkProject;touched++;}
+        if(bulkUom){next.uom=bulkUom;touched++;}
+        if(bulkTax){next.taxes=[bulkTax];touched++;}
+        if(hasQty){next.quantity=bulkQty&&bulkQty>0?bulkQty:1;touched++;}
+        if(hasPrice){next.unit_price=bulkPrice&&bulkPrice>=0?bulkPrice:0;touched++;}
+        const baseDesc=(next.description||'RFQ line').trim();
+        if(descPrefix||descSuffix){
+            next.description=`${descPrefix?descPrefix+' ':''}${baseDesc}${descSuffix?' '+descSuffix:''}`.trim();
+            touched++;
+        }
+        return next;
+    });
+    refreshAirRfqDerivedViews();
+    setAirRfqStatus(`Applied global column edits to ${draft.lines.length} row(s).`,'var(--green)');
+    if(!touched)showToast('No global values provided; nothing changed');
+}
+function addAirRfqLine(){
+    const draft=airfqState.revisionContext?.last_draft;
+    if(!draft){showToast('Generate RFQ first');return;}
+    if(!Array.isArray(draft.lines))draft.lines=[];
+    const defaultTax=(document.getElementById('airfq-default-tax').value||'').trim();
+    draft.lines.push({
+        product:'Non-Inventory: Construction in Process',
+        description:'New line',
+        project:draft.header?.project||'',
+        display_type:'',
+        quantity:1,
+        uom:'Unit',
+        unit_price:0,
+        taxes:defaultTax?[defaultTax]:[],
+    });
+    refreshAirRfqDerivedViews();
+}
+function removeAirRfqLine(idx){
+    const draft=airfqState.revisionContext?.last_draft;
+    if(!draft||!Array.isArray(draft.lines))return;
+    draft.lines=draft.lines.filter((_,i)=>i!==idx);
+    if(!draft.lines.length){
+        draft.lines=[{product:'Non-Inventory: Construction in Process',description:'RFQ line',project:draft.header?.project||'',display_type:'',quantity:1,uom:'Unit',unit_price:0,taxes:[]}];
+    }
+    refreshAirRfqDerivedViews();
+}
+function renderAirRfqValidation(validation){
+    const wrap=document.getElementById('airfq-validation');
+    if(!wrap)return;
+    const errors=(validation&&Array.isArray(validation.errors))?validation.errors:[];
+    const warnings=(validation&&Array.isArray(validation.warnings))?validation.warnings:[];
+    if(!errors.length&&!warnings.length){
+        wrap.innerHTML='<p style="color:var(--green);font-weight:600">No validation issues.</p>';
+        return;
+    }
+    let html='';
+    if(errors.length){
+        html+='<div style="margin-bottom:10px"><div style="font-size:11px;color:var(--red);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Blocking Errors</div><ul style="margin:0;padding-left:18px">';
+        errors.forEach(e=>{
+            const row=e.row!=null?` [line ${Number(e.row)+1}]`:'';
+            const cands=Array.isArray(e.candidates)&&e.candidates.length?` Candidates: ${e.candidates.join(' | ')}`:'';
+            html+=`<li style="margin-bottom:4px;color:var(--red)">${htmlEsc(e.field||'field')}${row}: ${htmlEsc(e.message||'error')}${htmlEsc(cands)}</li>`;
+        });
+        html+='</ul></div>';
+    }
+    if(warnings.length){
+        html+='<div><div style="font-size:11px;color:var(--yellow);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Warnings</div><ul style="margin:0;padding-left:18px">';
+        warnings.forEach(w=>{
+            const row=w.row!=null?` [line ${Number(w.row)+1}]`:'';
+            html+=`<li style="margin-bottom:4px;color:var(--yellow)">${htmlEsc(w.field||'field')}${row}: ${htmlEsc(w.message||'warning')}</li>`;
+        });
+        html+='</ul></div>';
+    }
+    wrap.innerHTML=html;
+}
+function renderAirRfqPreview(preview){
+    const wrap=document.getElementById('airfq-preview');
+    if(!wrap)return;
+    if(!preview||!preview.header){
+        wrap.innerHTML='<p style="color:var(--muted);padding:14px">No preview yet. Generate an RFQ first.</p>';
+        return;
+    }
+    const h=preview.header||{};
+    const lines=Array.isArray(preview.lines)?preview.lines:[];
+    const t=preview.totals||{};
+    let html='<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;margin-bottom:12px">';
+    html+=`<div style="background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:10px"><div style="font-size:10px;color:var(--muted);text-transform:uppercase">Vendor</div><div style="font-size:13px;font-weight:600">${htmlEsc(h.vendor||'')}</div></div>`;
+    html+=`<div style="background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:10px"><div style="font-size:10px;color:var(--muted);text-transform:uppercase">Vendor Reference</div><div style="font-size:13px;font-weight:600">${htmlEsc(h.vendor_reference||'')}</div></div>`;
+    html+=`<div style="background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:10px"><div style="font-size:10px;color:var(--muted);text-transform:uppercase">Deliver To</div><div style="font-size:13px;font-weight:600">${htmlEsc(h.deliver_to||'')}</div></div>`;
+    html+=`<div style="background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:10px"><div style="font-size:10px;color:var(--muted);text-transform:uppercase">Project</div><div style="font-size:13px;font-weight:600">${htmlEsc(h.project||'')}</div></div>`;
+    html+='</div>';
+    html+='<div style="overflow-x:auto"><table class="display" id="airfq-preview-tbl" style="width:100%"><thead><tr><th>#</th><th>Type</th><th>Product</th><th>Description</th><th>Project</th><th>Qty</th><th>UoM</th><th>Unit Price</th><th>Tax</th><th>Subtotal</th><th>Total</th></tr></thead><tbody>';
+    lines.forEach(l=>{
+        const isNote=(l.display_type||'')==='line_note';
+        html+=`<tr><td>${l.line_no||''}</td><td>${isNote?'Note':'Spend'}</td><td>${htmlEsc(l.product||'')}</td><td>${htmlEsc(l.description||'')}</td><td>${htmlEsc(l.project||'')}</td><td style="text-align:right">${isNote?'':Number(l.quantity||0).toFixed(2)}</td><td>${isNote?'':htmlEsc(l.uom||'')}</td><td style="text-align:right" data-order="${l.unit_price||0}">${isNote?'':fmtMoney2(l.unit_price||0)}</td><td>${isNote?'':htmlEsc(l.tax_label||'')}</td><td style="text-align:right" data-order="${l.line_subtotal||0}">${fmtMoney2(l.line_subtotal||0)}</td><td style="text-align:right" data-order="${l.line_total||0}">${fmtMoney2(l.line_total||0)}</td></tr>`;
+    });
+    html+='</tbody></table></div>';
+    html+=`<div style="display:flex;gap:20px;justify-content:flex-end;margin-top:10px;font-size:13px"><div>Untaxed: <strong>${fmtMoney2(t.untaxed_amount||0)}</strong></div><div>Tax: <strong>${fmtMoney2(t.tax_amount||0)}</strong></div><div>Total: <strong style="color:var(--green)">${fmtMoney2(t.total_amount||0)}</strong></div></div>`;
+    wrap.innerHTML=html;
+    if(dtI['airfq-preview-tbl'])dtI['airfq-preview-tbl'].destroy();
+    dtI['airfq-preview-tbl']=$('#airfq-preview-tbl').DataTable(dtOpts({pageLength:25,order:[[0,'asc']]}));
+}
+async function loadAirRfq(forceLive){
+    try{
+        const isForce=Boolean(forceLive);
+        setAirRfqStatus(isForce?'Refreshing lookup cache...':'Loading lookup values...','var(--muted)');
+        const qs=isForce?'?mode=bq_only&force_refresh=1':'?mode=bq_only';
+        const res=await fetch('/api/v2/ai-rfq/lookups'+qs);
+        const d=await res.json();
+        if(d.error){setAirRfqStatus('Lookup warning: '+d.error,'var(--yellow)');return;}
+        const values=(d.values&&typeof d.values==='object')?d.values:{};
+        airfqState.lookupValues=values;
+        const vendors=Array.isArray(values.vendors)?values.vendors:[];
+        populateAirRfqLookupInputs(values);
+        loadAirRfqHistory();
+        const warnings=Array.isArray(d.warnings)?d.warnings:[];
+        if(warnings.length)setAirRfqStatus('Lookups loaded with warnings: '+warnings.join(' | '),'var(--yellow)');
+        else setAirRfqStatus(`Lookups loaded (${vendors.length} vendors).`,'var(--green)');
+        if(airfqState.revisionContext?.last_draft)refreshAirRfqDerivedViews();
+    }catch(e){
+        setAirRfqStatus('Lookup error: '+e.message,'var(--red)');
+    }
+}
+async function generateAirRfq(isRegenerate){
+    const vendor=(document.getElementById('airfq-vendor').value||'').trim();
+    const referencePo=(document.getElementById('airfq-reference-po').value||'').trim().toUpperCase();
+    const paymentNote=(document.getElementById('airfq-payment-note').value||'').trim();
+    const basePrompt=(document.getElementById('airfq-prompt').value||'').trim();
+    const prompt=referencePo?`${basePrompt}\nReference PO: ${referencePo}`.trim():basePrompt;
+    const fileInput=document.getElementById('airfq-pdf');
+    const file=(fileInput&&fileInput.files&&fileInput.files[0])?fileInput.files[0]:null;
+    const btnGenerate=document.getElementById('btn-airfq-generate');
+    const btnRegenerate=document.getElementById('btn-airfq-regenerate');
+    const btnDownload=document.getElementById('btn-airfq-download');
+    if(!vendor&&!airfqState.revisionContext?.vendor){showToast('Vendor is required');return;}
+    const knownVendors=(airfqState.lookupValues&&Array.isArray(airfqState.lookupValues.vendors))?airfqState.lookupValues.vendors:[];
+    if(vendor&&knownVendors.length){
+        const exact=knownVendors.includes(vendor)?vendor:(knownVendors.find(v=>(v||'').toLowerCase()===vendor.toLowerCase())||'');
+        if(exact){
+            document.getElementById('airfq-vendor').value=exact;
+        }else{
+            setAirRfqStatus('Vendor must match a known vendor name exactly. Pick from lookup list or refresh BQ lookups.','var(--red)');
+            showToast('Vendor not found in lookup list');
+            return;
+        }
+    }
+    if(!isRegenerate&&!file&&!airfqState.revisionContext?.quote_text){showToast('Attach a quote PDF for initial generation');return;}
+    if(isRegenerate&&!airfqState.revisionContext&&!file){showToast('Run AI Generate first or attach a PDF');return;}
+    const endpoint=isRegenerate?'/api/v2/ai-rfq/regenerate':'/api/v2/ai-rfq/generate';
+    btnGenerate.disabled=true;btnRegenerate.disabled=true;btnDownload.disabled=true;
+    startAirRfqProgress(isRegenerate?'Regenerating':'Generating');
+    const startedAt=Date.now();
+    try{
+        const headerDeliver=(document.getElementById('airfq-header-deliver').value||'').trim();
+        const headerProject=(document.getElementById('airfq-header-project').value||'').trim();
+        const form=new FormData();
+        form.append('vendor',vendor||airfqState.revisionContext?.vendor||'');
+        form.append('prompt',prompt);
+        form.append('payment_milestones_note',paymentNote);
+        if(headerDeliver)form.append('deliver_to',headerDeliver);
+        if(headerProject)form.append('header_project',headerProject);
+        if(airfqState.revisionContext)form.append('prior_context',JSON.stringify(airfqState.revisionContext));
+        if(file)form.append('file',file);
+        const res=await fetch(endpoint,{method:'POST',body:form});
+        const d=await res.json();
+        if(d.error){setAirRfqStatus('Error: '+d.error,'var(--red)');showToast('AI RFQ failed');return;}
+        airfqState.revisionContext=d.revision_context||null;
+        airfqState.csvText=d.csv_text||'';
+        airfqState.csvFilename=d.csv_filename||'rfq_ai_generated.csv';
+        airfqState.lastValidation=d.validation||{};
+        renderAirRfqValidation(d.validation||{});
+        airfqState.lastPreview=d.preview||{};
+        refreshAirRfqDerivedViews();
+        loadAirRfqHistory();
+        const elapsed=((Date.now()-startedAt)/1000);
+        const totalS=Number(d.meta?.timing?.total_s||elapsed).toFixed(1);
+        const llmS=Number(d.meta?.timing?.llm_s||0).toFixed(1);
+        const blocking=Number(d.validation?.blocking_error_count||0);
+        const warningCount=Array.isArray(d.validation?.warnings)?d.validation.warnings.length:0;
+        if(blocking>0)setAirRfqStatus(`Generated in ${totalS}s (LLM ${llmS}s) with ${blocking} blocking validation issue(s).`,'var(--red)');
+        else if(warningCount>0)setAirRfqStatus(`Generated in ${totalS}s (LLM ${llmS}s) with ${warningCount} warning(s).`,'var(--yellow)');
+        else setAirRfqStatus(`RFQ generated and validated successfully in ${totalS}s (LLM ${llmS}s).`,'var(--green)');
+    }catch(e){
+        setAirRfqStatus('Error: '+e.message,'var(--red)');
+    }finally{
+        stopAirRfqProgress();
+        btnGenerate.disabled=false;btnRegenerate.disabled=false;
+        btnDownload.disabled=!airfqState.csvText;
+    }
+}
+function downloadAirRfqCsv(){
+    if(!airfqState.csvText){showToast('No CSV to download yet');return;}
+    const blob=new Blob([airfqState.csvText],{type:'text/csv;charset=utf-8'});
+    downloadBlob(airfqState.csvFilename||'rfq_ai_generated.csv',blob);
+}
+function resetAirRfqForm(){
+    stopAirRfqProgress();
+    airfqState.revisionContext=null;
+    airfqState.csvText='';
+    airfqState.csvFilename='rfq_ai_generated.csv';
+    airfqState.lastValidation=null;
+    airfqState.lastPreview=null;
+    const ids=['airfq-vendor','airfq-reference-po','airfq-history-select','airfq-prompt','airfq-payment-note','airfq-header-project','airfq-header-deliver','airfq-default-tax','airfq-bulk-product','airfq-bulk-project','airfq-bulk-uom','airfq-bulk-tax','airfq-bulk-qty','airfq-bulk-price','airfq-bulk-desc-prefix','airfq-bulk-desc-suffix'];
+    ids.forEach(id=>{const el=document.getElementById(id);if(el)el.value='';});
+    const file=document.getElementById('airfq-pdf');if(file)file.value='';
+    const csv=document.getElementById('airfq-csv');if(csv)csv.value='';
+    const validation=document.getElementById('airfq-validation');if(validation)validation.innerHTML='<p style=\"color:var(--muted)\">No validation yet.</p>';
+    const preview=document.getElementById('airfq-preview');if(preview)preview.innerHTML='<p style=\"color:var(--muted);padding:14px\">No preview yet. Generate an RFQ first.</p>';
+    const editor=document.getElementById('airfq-line-editor');if(editor)editor.innerHTML='<p style=\"color:var(--muted);padding:12px\">No lines available.</p>';
+    const btnDownload=document.getElementById('btn-airfq-download');if(btnDownload)btnDownload.disabled=true;
+    setAirRfqStatus('Form reset. Ready for a new RFQ run.','var(--green)');
+}
+
 /* ====== SETTINGS ====== */
 let savedSettings={};
+let settingsAccess={};
+function applySettingsAccessUi(){
+    const canEdit=!!settingsAccess.can_edit_settings;
+    const canManage=!!settingsAccess.can_manage_access;
+    const role=settingsAccess.role||'viewer';
+    const owner=settingsAccess.owner_email||'';
+    const user=settingsAccess.user_email||'';
+    const summary=document.getElementById('settings-access-summary');
+    if(summary){
+        const roleLabel=role.charAt(0).toUpperCase()+role.slice(1);
+        summary.textContent=`Signed in as ${user||'unknown'} | Role: ${roleLabel}${owner?` | Owner: ${owner}`:''}`;
+        summary.style.color=canEdit?'var(--muted)':'var(--yellow)';
+    }
+
+    document.querySelectorAll('#page-settings textarea, #page-settings input, #page-settings select').forEach(el=>{
+        const id=el.id||'';
+        if(id==='settings-owner-email'||id==='settings-editor-emails'){
+            el.disabled=!canManage;
+        }else{
+            el.disabled=!canEdit;
+        }
+    });
+
+    const saveBtn=document.getElementById('btn-save-settings');
+    if(saveBtn)saveBtn.disabled=!canEdit;
+    const refreshBtn=document.getElementById('btn-refresh-odoo');
+    if(refreshBtn)refreshBtn.disabled=!canEdit;
+    const rampBtn=document.getElementById('btn-upload-ramp');
+    if(rampBtn)rampBtn.disabled=!canEdit;
+    const aiBtn=document.getElementById('btn-gen-milestones');
+    if(aiBtn)aiBtn.disabled=!canEdit;
+}
 async function loadSettings(){
     const res=await fetch('/api/settings');savedSettings=await res.json();
+    settingsAccess=(savedSettings._access&&typeof savedSettings._access==='object')?savedSettings._access:{};
     const mRes=await fetch('/api/modules');const mods=await mRes.json();
+
+    /* --- Creator names textarea --- */
+    const names=savedSettings.po_creator_names||[];
+    const ta=document.getElementById('settings-creators');
+    ta.value=names.join('\n');
+    ta.addEventListener('input',()=>{
+        const count=ta.value.split('\n').filter(l=>l.trim()).length;
+        document.getElementById('creator-count').textContent=count+' names';
+    });
+    document.getElementById('creator-count').textContent=names.length+' names';
+
+    /* --- Milestone AI prompt settings --- */
+    document.getElementById('settings-milestone-program-context').value=savedSettings.milestone_ai_program_context||'';
+    document.getElementById('settings-milestone-system-prompt').value=savedSettings.milestone_ai_system_prompt||'';
+    document.getElementById('settings-milestone-user-prefix').value=savedSettings.milestone_ai_user_prefix||'';
+    document.getElementById('settings-classification-domain-context').value=savedSettings.classification_ai_domain_context||'';
+    document.getElementById('settings-classification-system-prompt').value=savedSettings.classification_ai_system_prompt||'';
+    document.getElementById('settings-rfq-provider').value=savedSettings.rfq_ai_provider||'gemini';
+    document.getElementById('settings-rfq-validation-mode').value=savedSettings.rfq_validation_mode||'bq_only';
+    document.getElementById('settings-rfq-user-prefix').value=savedSettings.rfq_ai_user_prefix||'';
+    document.getElementById('settings-rfq-system-prompt').value=savedSettings.rfq_ai_system_prompt||'';
+    document.getElementById('settings-owner-email').value=savedSettings.settings_owner_email||'';
+    document.getElementById('settings-editor-emails').value=(savedSettings.settings_editor_emails||[]).join('\n');
+    document.getElementById('settings-refresh-cron').value=savedSettings.ops_refresh_cron||'0 8 * * *';
+    document.getElementById('settings-refresh-timezone').value=savedSettings.ops_refresh_timezone||'Etc/UTC';
+    document.getElementById('settings-alert-emails').value=(savedSettings.ops_alert_emails||[]).join('\n');
+
+    /* --- Line capacities table --- */
     const caps=savedSettings.line_capacities||{};
     const sqfts=savedSettings.line_sqft||{};
     let html='<table style="width:100%;border-collapse:collapse"><thead><tr style="border-bottom:1px solid var(--border)"><th style="text-align:left;padding:8px;color:var(--muted);font-size:11px;text-transform:uppercase">Line</th><th style="text-align:left;padding:8px;color:var(--muted);font-size:11px;text-transform:uppercase">Capacity (GWh)</th><th style="text-align:left;padding:8px;color:var(--muted);font-size:11px;text-transform:uppercase">Floor Area (ft&sup2;)</th></tr></thead><tbody>';
@@ -2702,9 +4523,20 @@ async function loadSettings(){
     });
     html+='</tbody></table>';
     document.getElementById('settings-lines').innerHTML=html;
+    applySettingsAccessUi();
 }
 async function saveSettings(){
+    if(!settingsAccess.can_edit_settings){
+        showToast('You do not have permission to edit settings');
+        return;
+    }
     const mRes=await fetch('/api/modules');const mods=await mRes.json();
+
+    /* Collect creator names from textarea */
+    const rawNames=document.getElementById('settings-creators').value;
+    const creatorNames=rawNames.split('\n').map(n=>n.trim().toLowerCase()).filter(n=>n.length>0);
+
+    /* Collect line capacities */
     const caps={},sqfts={};
     mods.forEach(m=>{
         const cv=parseFloat(document.getElementById('cap-'+m).value);
@@ -2712,10 +4544,50 @@ async function saveSettings(){
         if(!isNaN(cv)&&cv>0)caps[m]=cv;
         if(!isNaN(sv)&&sv>0)sqfts[m]=sv;
     });
-    const body={line_capacities:caps,line_sqft:sqfts};
+
+    const body={
+        po_creator_names:creatorNames,
+        line_capacities:caps,
+        line_sqft:sqfts,
+        milestone_ai_program_context:(document.getElementById('settings-milestone-program-context').value||'').trim(),
+        milestone_ai_system_prompt:(document.getElementById('settings-milestone-system-prompt').value||'').trim(),
+        milestone_ai_user_prefix:(document.getElementById('settings-milestone-user-prefix').value||'').trim(),
+        classification_ai_domain_context:(document.getElementById('settings-classification-domain-context').value||'').trim(),
+        classification_ai_system_prompt:(document.getElementById('settings-classification-system-prompt').value||'').trim(),
+        rfq_ai_provider:(document.getElementById('settings-rfq-provider').value||'gemini').trim(),
+        rfq_validation_mode:(document.getElementById('settings-rfq-validation-mode').value||'bq_only').trim(),
+        rfq_ai_user_prefix:(document.getElementById('settings-rfq-user-prefix').value||'').trim(),
+        rfq_ai_system_prompt:(document.getElementById('settings-rfq-system-prompt').value||'').trim(),
+        ops_refresh_cron:(document.getElementById('settings-refresh-cron').value||'0 8 * * *').trim(),
+        ops_refresh_timezone:(document.getElementById('settings-refresh-timezone').value||'Etc/UTC').trim(),
+        ops_alert_emails:(document.getElementById('settings-alert-emails').value||'')
+            .split('\n')
+            .map(v=>v.trim().toLowerCase())
+            .filter(v=>v.length>0),
+    };
+    if(settingsAccess.can_manage_access){
+        body.settings_owner_email=(document.getElementById('settings-owner-email').value||'').trim().toLowerCase();
+        body.settings_editor_emails=(document.getElementById('settings-editor-emails').value||'')
+            .split('\n')
+            .map(v=>v.trim().toLowerCase())
+            .filter(v=>v.length>0);
+    }
     const res=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     const d=await res.json();
-    if(d.ok){document.getElementById('settings-ok').style.display='inline';setTimeout(()=>{document.getElementById('settings-ok').style.display='none';},2500);showToast('Settings saved');}
+    if(!res.ok||d.error){
+        showToast(d.error||('Settings save failed ('+res.status+')'));
+        return;
+    }
+    if(d.ok){
+        document.getElementById('settings-ok').style.display='inline';
+        document.getElementById('creator-count').textContent=creatorNames.length+' names';
+        setTimeout(()=>{document.getElementById('settings-ok').style.display='none';},2500);
+        showToast('Settings saved ('+creatorNames.length+' creators, capacities updated)');
+        if(d.access&&typeof d.access==='object'){
+            settingsAccess=d.access;
+            applySettingsAccessUi();
+        }
+    }
 }
 
 /* ====== UNIT ECONOMICS ====== */
@@ -2789,7 +4661,7 @@ async function loadUnitEconomics(){
 function showToast(msg){const t=document.getElementById('toast');t.textContent=msg;t.style.display='block';setTimeout(()=>{t.style.display='none';},3000);}
 function initFromHash(){
     const hash=window.location.hash.slice(1);
-    if(hash&&['executive','about','source','stations','forecasting','vendors','spares','detail','timeline','projects','uniteco','settings'].includes(hash)){
+    if(hash&&['executive','about','source','stations','forecasting','vendors','spares','detail','timeline','projects','uniteco','settings','airfq'].includes(hash)){
         const navItem=document.querySelector(`.nav-item[onclick*="showPage('${hash}')"]`);
         showPage(hash,navItem);
     }else{
@@ -2798,6 +4670,7 @@ function initFromHash(){
 }
 window.addEventListener('hashchange',initFromHash);
 // Wait for line filter default selection before loading data
+initUiPrefs();
 initLineFilter().then(function(){ initFromHash(); });
 </script>
 </body>
@@ -2919,8 +4792,9 @@ def api_drilldown():
         df = df[df["created_by_name"] == employee]
     if subcategory and "mfg_subcategory" in df.columns:
         df = df[df["mfg_subcategory"] == subcategory]
-    if payment_status and "bill_payment_status" in df.columns:
-        bps = df["bill_payment_status"].fillna("").astype(str).str.strip().replace("", "no_bill")
+    status_col = "po_payment_status_v2" if "po_payment_status_v2" in df.columns else "bill_payment_status"
+    if payment_status and status_col in df.columns:
+        bps = df[status_col].fillna("").astype(str).str.strip().replace("", "no_bill")
         df = df[bps == payment_status]
     if week:
         df["_week"] = df["_date"].dt.isocalendar().apply(
@@ -2933,7 +4807,7 @@ def api_drilldown():
 
     cols = ["source", "po_number", "date_order", "vendor_name", "mfg_subcategory",
             "item_description", "station_id", "project_name", "mapping_confidence",
-            "bill_payment_status", "price_subtotal", "price_total", "created_by_name"]
+            "bill_payment_status", "po_payment_status_v2", "price_subtotal", "price_total", "created_by_name"]
     rows = df.sort_values("_sub", ascending=False).head(200)
     records = [{c: row.get(c, "") for c in cols} for _, row in rows.iterrows()]
 
@@ -2943,6 +4817,9 @@ def api_drilldown():
 @app.route("/api/forecast", methods=["POST"])
 def api_forecast_update():
     """Save a forecast override for a station."""
+    denied = _require_settings_editor()
+    if denied:
+        return denied
     body = request.get_json(force=True)
     station_id = body.get("station_id", "")
     new_forecast = body.get("forecasted_cost")
@@ -2969,6 +4846,9 @@ def api_forecast_update():
 @app.route("/api/forecast/bulk", methods=["POST"])
 def api_forecast_bulk_update():
     """Save many station forecast overrides in one request."""
+    denied = _require_settings_editor()
+    if denied:
+        return denied
     body = request.get_json(force=True)
     raw_updates = body.get("updates", [])
     if not isinstance(raw_updates, list):
@@ -3109,6 +4989,9 @@ def _unlock_forecast_overrides(station_ids: list[str] | None = None) -> dict[str
 @app.route("/api/forecast/unlock", methods=["POST"])
 def api_forecast_unlock():
     """Remove a manual forecast override lock for a station."""
+    denied = _require_settings_editor()
+    if denied:
+        return denied
     body = request.get_json(force=True)
     station_id = str(body.get("station_id", "")).strip()
     if not station_id:
@@ -3127,6 +5010,9 @@ def api_forecast_unlock():
 @app.route("/api/forecast/lock", methods=["POST"])
 def api_forecast_lock():
     """Create/refresh a manual forecast override lock for a station."""
+    denied = _require_settings_editor()
+    if denied:
+        return denied
     body = request.get_json(force=True)
     station_id = str(body.get("station_id", "")).strip()
     if not station_id:
@@ -3152,6 +5038,9 @@ def api_forecast_lock():
 @app.route("/api/forecast/lock_all", methods=["POST"])
 def api_forecast_lock_all():
     """Lock many forecast rows (defaults to all rows when station_ids is omitted)."""
+    denied = _require_settings_editor()
+    if denied:
+        return denied
     body = request.get_json(silent=True) or {}
     station_ids_raw = body.get("station_ids")
     station_ids = _normalize_station_ids(station_ids_raw)
@@ -3164,6 +5053,9 @@ def api_forecast_lock_all():
 @app.route("/api/forecast/unlock_all", methods=["POST"])
 def api_forecast_unlock_all():
     """Unlock many forecast rows (defaults to all locks when station_ids is omitted)."""
+    denied = _require_settings_editor()
+    if denied:
+        return denied
     body = request.get_json(silent=True) or {}
     station_ids_raw = body.get("station_ids")
     station_ids = _normalize_station_ids(station_ids_raw)
@@ -3176,6 +5068,9 @@ def api_forecast_unlock_all():
 @app.route("/api/forecast/refresh", methods=["POST"])
 def api_forecast_refresh():
     """Refresh station forecast values from configured BF1/BF2 Google Sheets."""
+    denied = _require_settings_editor()
+    if denied:
+        return denied
     body = request.get_json(silent=True) or {}
     settings = store.read_json("dashboard_settings.json")
     if not isinstance(settings, dict):
@@ -3286,25 +5181,109 @@ def api_forecast_refresh():
 
 @app.route("/api/settings", methods=["GET"])
 def api_settings_get():
-    """Return all dashboard settings (line capacities, sq ft, etc.)."""
-    settings = store.read_json("dashboard_settings.json")
-    if not isinstance(settings, dict):
-        settings = {}
+    """Return all dashboard settings (line capacities, sq ft, creator names, etc.)."""
+    user_email = current_user_email()
+    settings, changed = load_settings_with_access_defaults(bootstrap_user_email=user_email)
+    if changed:
+        store.write_json("dashboard_settings.json", settings)
+    access = get_access_context(settings, user_email=user_email)
+
     settings.setdefault("bf1_sheet_url", DEFAULT_BF1_SHEET_URL)
     settings.setdefault("bf2_sheet_url", DEFAULT_BF2_SHEET_URL)
+    if "po_creator_names" not in settings:
+        from capex_pipeline import DEFAULT_CREATOR_NAMES
+        settings["po_creator_names"] = DEFAULT_CREATOR_NAMES
+    settings.setdefault("milestone_ai_program_context", "")
+    settings.setdefault("milestone_ai_user_prefix", "")
+    if not settings.get("milestone_ai_system_prompt"):
+        try:
+            from classify_agent import MILESTONE_SYSTEM_PROMPT
+            settings["milestone_ai_system_prompt"] = MILESTONE_SYSTEM_PROMPT
+        except Exception:
+            settings["milestone_ai_system_prompt"] = ""
+    settings.setdefault(
+        "classification_ai_domain_context",
+        (
+            "Base Power is a BESS manufacturer at BF1 with Module, Cell, and Inverter lines. "
+            "Station IDs follow BASE1-MODx/CELLx/INV1-STxxxxx. "
+            "Prefer manufacturing station mapping for process equipment, controls/electrical, mechanical assemblies, "
+            "integration/commissioning, quality/metrology, and production software. "
+            "Use null station for true facility/office/IT/admin spend. "
+            "Common vendors include automation integrators, tooling suppliers, controls vendors, and electrical distributors."
+        ),
+    )
+    if not settings.get("classification_ai_system_prompt"):
+        try:
+            from classify_agent import SYSTEM_PROMPT_TEMPLATE
+            settings["classification_ai_system_prompt"] = SYSTEM_PROMPT_TEMPLATE.read_text(encoding="utf-8")
+        except Exception:
+            settings["classification_ai_system_prompt"] = ""
+    settings.setdefault("rfq_ai_provider", "gemini")
+    settings["rfq_validation_mode"] = "bq_only"
+    settings.setdefault("rfq_ai_user_prefix", "")
+    if not settings.get("rfq_ai_system_prompt"):
+        try:
+            settings["rfq_ai_system_prompt"] = RFQ_SYSTEM_PROMPT_TEMPLATE.read_text(encoding="utf-8")
+        except Exception:
+            settings["rfq_ai_system_prompt"] = ""
+    settings.setdefault("ops_refresh_cron", "0 8 * * *")
+    settings.setdefault("ops_refresh_timezone", "Etc/UTC")
+    settings.setdefault("ops_alert_emails", [])
+    settings["_access"] = access
     return jsonify(settings)
 
 
 @app.route("/api/settings", methods=["POST"])
 def api_settings_save():
     """Save dashboard settings."""
-    body = request.get_json(force=True)
-    settings = store.read_json("dashboard_settings.json")
-    if not isinstance(settings, dict):
-        settings = {}
-    settings.update(body)
+    body = request.get_json(force=True) or {}
+    user_email = current_user_email()
+    settings, changed = load_settings_with_access_defaults(bootstrap_user_email=user_email)
+    if changed:
+        store.write_json("dashboard_settings.json", settings)
+    access = get_access_context(settings, user_email=user_email)
+
+    if not access.get("can_edit_settings"):
+        return jsonify({"ok": False, "error": "Settings edit access required", "access": access}), 403
+
+    touches_access = (OWNER_KEY in body) or (EDITORS_KEY in body)
+    if touches_access and not access.get("can_manage_access"):
+        return jsonify({
+            "ok": False,
+            "error": "Only the settings owner can modify access control.",
+            "access": access,
+        }), 403
+
+    if access.get("can_manage_access") and OWNER_KEY in body:
+        candidate_owner = normalize_email(body.get(OWNER_KEY, ""))
+        if not candidate_owner:
+            return jsonify({"ok": False, "error": "settings_owner_email cannot be empty"}), 400
+        if not is_company_email(candidate_owner):
+            return jsonify({"ok": False, "error": "settings_owner_email must be a company email"}), 400
+        settings[OWNER_KEY] = candidate_owner
+
+    if access.get("can_manage_access") and EDITORS_KEY in body:
+        settings[EDITORS_KEY] = normalize_email_list(body.get(EDITORS_KEY, []))
+        if settings.get(OWNER_KEY) and settings[OWNER_KEY] not in settings[EDITORS_KEY]:
+            settings[EDITORS_KEY].insert(0, settings[OWNER_KEY])
+
+    if "ops_alert_emails" in body:
+        settings["ops_alert_emails"] = normalize_email_list(body.get("ops_alert_emails", []))
+    if "ops_refresh_cron" in body:
+        cron = str(body.get("ops_refresh_cron", "")).strip()
+        settings["ops_refresh_cron"] = cron if cron else "0 8 * * *"
+    if "ops_refresh_timezone" in body:
+        tz = str(body.get("ops_refresh_timezone", "")).strip()
+        settings["ops_refresh_timezone"] = tz if tz else "Etc/UTC"
+
+    for key, value in body.items():
+        if key in {OWNER_KEY, EDITORS_KEY, "ops_alert_emails", "ops_refresh_cron", "ops_refresh_timezone"}:
+            continue
+        settings[key] = value
+
+    settings, _ = ensure_access_defaults(settings, bootstrap_user_email=user_email)
     store.write_json("dashboard_settings.json", settings)
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "access": get_access_context(settings, user_email=user_email)})
 
 
 @app.route("/api/unit-economics")
@@ -3582,6 +5561,21 @@ def index():
     return render_template_string(DASHBOARD_HTML)
 
 
+# ---------------------------------------------------------------------------
+# V2 pages: always registered when capex_v2_pages module is present.
+# The /api/v2/* endpoints are additive -- they don't affect existing routes.
+# APP_MODE=dashboard_v2 is only needed for Cloud Run deployment distinction.
+# ---------------------------------------------------------------------------
+try:
+    from capex_v2_pages import register_v2_routes
+    register_v2_routes(app)
+    _V2_ENABLED = True
+except ImportError:
+    _V2_ENABLED = False
+
+
 if __name__ == "__main__":
     print("Mfg Budgeting App: http://localhost:5050")
+    if _V2_ENABLED:
+        print("  V2 pages enabled (/api/v2/*)")
     app.run(host="0.0.0.0", port=5050, debug=True)

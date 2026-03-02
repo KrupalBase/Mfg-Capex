@@ -7,7 +7,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# APP_MODE controls which Flask app to run: "dashboard" or "review"
+# APP_MODE controls which Flask app to run: "dashboard", "dashboard_v2", or "review"
 ENV APP_MODE=dashboard
 ENV GCS_BUCKET=""
 ENV PORT=8080

@@ -7,24 +7,23 @@ from __future__ import annotations
 
 import pathlib
 
-from google.cloud import bigquery
-
+import bq_dataset
 from po_export_utils import clean_po_dataframe
 
-
-PROJECT_ID = "gtm-analytics-447201"
 SQL_FILE = pathlib.Path(__file__).resolve().parent / "po_by_krupal_patel.sql"
 
 
 def main() -> None:
-    client = bigquery.Client(project=PROJECT_ID)
+    odoo_ref = f"{bq_dataset.ODOO_SOURCE_PROJECT}.{bq_dataset.ODOO_SOURCE_DATASET}"
+    client = bq_dataset.get_source_client()
     query_text = SQL_FILE.read_text(encoding="utf-8")
     query_text = "\n".join(
         line for line in query_text.splitlines()
         if not line.strip().startswith("--")
     ).strip().rstrip(";")
+    query_text = query_text.replace("{odoo_source}", odoo_ref)
 
-    print("Running PO-by-Krupal-Patel query...")
+    print(f"Running PO-by-Krupal-Patel query on {odoo_ref}...")
     df = client.query(query_text).to_dataframe()
     print(f"Rows: {len(df)}")
     if df.empty:

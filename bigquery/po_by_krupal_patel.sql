@@ -1,11 +1,10 @@
 -- Purchase orders created by Krupal Patel: line-level data with Vendor, Project, and key PO fields.
--- Dataset: gtm-analytics-447201.odoo_public
--- Run in: https://console.cloud.google.com/bigquery?ws=!1m4!1m3!3m2!1sgtm-analytics-447201!2sodoo_public
+-- Dataset: {odoo_source}
 
 WITH creator AS (
   SELECT u.id AS user_id
-  FROM `gtm-analytics-447201.odoo_public.res_users` u
-  JOIN `gtm-analytics-447201.odoo_public.res_partner` p ON u.partner_id = p.id
+  FROM `{odoo_source}.res_users` u
+  JOIN `{odoo_source}.res_partner` p ON u.partner_id = p.id
   WHERE LOWER(p.name) LIKE '%krupal%' AND LOWER(p.name) LIKE '%patel%'
 )
 SELECT
@@ -47,11 +46,11 @@ SELECT
   po.notes AS po_notes,
   po.create_date AS po_created_date,
   po.write_date AS po_updated_date
-FROM `gtm-analytics-447201.odoo_public.purchase_order` po
-JOIN `gtm-analytics-447201.odoo_public.purchase_order_line` pol ON pol.order_id = po.id
-LEFT JOIN `gtm-analytics-447201.odoo_public.res_partner` v ON po.partner_id = v.id
-LEFT JOIN `gtm-analytics-447201.odoo_public.account_analytic_account` aaa ON pol.analytic_account_project_id = aaa.id
-LEFT JOIN `gtm-analytics-447201.odoo_public.res_users` creator_u ON po.create_uid = creator_u.id
-LEFT JOIN `gtm-analytics-447201.odoo_public.res_partner` creator_p ON creator_u.partner_id = creator_p.id
+FROM `{odoo_source}.purchase_order` po
+JOIN `{odoo_source}.purchase_order_line` pol ON pol.order_id = po.id
+LEFT JOIN `{odoo_source}.res_partner` v ON po.partner_id = v.id
+LEFT JOIN `{odoo_source}.account_analytic_account` aaa ON pol.analytic_account_project_id = aaa.id
+LEFT JOIN `{odoo_source}.res_users` creator_u ON po.create_uid = creator_u.id
+LEFT JOIN `{odoo_source}.res_partner` creator_p ON creator_u.partner_id = creator_p.id
 WHERE po.create_uid IN (SELECT user_id FROM creator)
 ORDER BY po.date_order DESC, po.id, pol.sequence;
