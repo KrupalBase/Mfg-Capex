@@ -30,18 +30,13 @@ from po_export_utils import (
     extract_deposit_info,
     extract_part_numbers,
     load_and_normalize_ramp,
-    load_and_normalize_ramp_from_odoo,
     load_bf1_stations,
     merge_section_headers,
     split_product_category,
     tag_capex_flag,
 )
 
-DEFAULT_ODOO_SOURCE_PROJECT = "gtm-analytics-447201"
-DEFAULT_ODOO_SOURCE_DATASET = "odoo_public"
-ODOO_SOURCE_PROJECT = os.environ.get("ODOO_SOURCE_PROJECT", DEFAULT_ODOO_SOURCE_PROJECT)
-ODOO_SOURCE_DATASET = os.environ.get("ODOO_SOURCE_DATASET", DEFAULT_ODOO_SOURCE_DATASET)
-QUERY_PROJECT = os.environ.get("BQ_QUERY_PROJECT", ODOO_SOURCE_PROJECT)
+import bq_dataset
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = store.local_data_dir()
 SQL_FILE = BASE_DIR / "po_by_creators_last_7m.sql"
@@ -57,6 +52,28 @@ COLUMNS_TO_DROP = [
 ]
 
 # Default creator names (Andy Ross org). Overridden by dashboard_settings.json.
+def _safe_fillna(df: pd.DataFrame, fill_value: str = "") -> pd.DataFrame:
+    """Fill NaN only in string/object columns; leave typed columns (Int64, etc.) alone."""
+    out = df.copy()
+    for col in out.columns:
+        dtype = out[col].dtype
+        if pd.api.types.is_object_dtype(dtype) or pd.api.types.is_string_dtype(dtype):
+            out[col] = out[col].fillna(fill_value)
+        elif hasattr(dtype, "name") and dtype.name in ("Int8", "Int16", "Int32", "Int64",
+                                                         "UInt8", "UInt16", "UInt32", "UInt64"):
+            pass
+        elif pd.api.types.is_bool_dtype(dtype):
+            pass
+        elif pd.api.types.is_float_dtype(dtype):
+            pass
+        else:
+            try:
+                out[col] = out[col].fillna(fill_value)
+            except (ValueError, TypeError):
+                out[col] = out[col].astype("object").where(out[col].notna(), fill_value)
+    return out
+
+
 DEFAULT_CREATOR_NAMES: list[str] = [
     "alex mitchell", "ali nik-ahd", "amber platt", "andy ross", "avi anklesaria",
     "benjamin munoz", "brandon dillard", "brian connellan", "callum marsh",
@@ -68,6 +85,17 @@ DEFAULT_CREATOR_NAMES: list[str] = [
     "maintenance bot", "markia darby", "mike webb", "rene santos", "reyes mata",
     "scott rossi", "vitor ayres", "zach patterson", "zack de la rosa anderson",
 ]
+
+
+def _get_bigquery_client():
+    """Build a BigQuery client for Odoo/source pulls.
+
+    Delegates to ``bq_dataset.get_source_client`` which handles optional user
+    OAuth (when injected by the dashboard refresh endpoint) and falls back to
+    the service-account credentials.
+    """
+    token = str(os.environ.get("GOOGLE_OAUTH_ACCESS_TOKEN", "") or "").strip() or None
+    return bq_dataset.get_source_client(oauth_token=token)
 
 
 def _load_creator_names() -> list[str]:
@@ -98,6 +126,7 @@ DEFAULT_PROJECT_CODES: list[str] = [
     "BF1-Quality Equipment",
     "BF1-Warehousing and Material Handling",
     "CIP-BF1-",
+    "CIP-BF2-",
 ]
 
 
@@ -105,7 +134,7 @@ def _load_project_codes() -> list[str]:
     """Load CAPEX project codes from settings, falling back to defaults.
 
     Codes can be exact matches (e.g., 'BF1-Module Line 1') or prefixes
-    (e.g., 'CIP-BF1-' matches all CIP station codes).
+    (e.g., 'CIP-BF1-' / 'CIP-BF2-' match all CIP station codes).
     """
     settings = store.read_json("dashboard_settings.json")
     if isinstance(settings, dict) and settings.get("capex_project_codes"):
@@ -118,7 +147,7 @@ def _load_project_codes() -> list[str]:
 def _format_project_codes_sql(codes: list[str]) -> str:
     """Build a SQL WHERE clause fragment that matches project codes.
 
-    Odoo stores project names as JSON: {"en_US": "CIP-BF1-MOD1-ST22000 : ..."}
+    Odoo stores project names as JSON: {"en_US": "CIP-BF2-MOD3-ST33000-03 : ..."}
     so we use LIKE patterns against the name field.
     """
     conditions = []
@@ -144,7 +173,6 @@ def load_previous_enrichments() -> pd.DataFrame:
     """
     prev = pd.DataFrame()
     try:
-        import bq_dataset
         prev = bq_dataset.read_table("po_lines")
     except Exception:
         pass
@@ -157,6 +185,8 @@ def load_previous_enrichments() -> pd.DataFrame:
 
     keep = ["line_id"] + [c for c in ENRICHMENT_COLUMNS if c in prev.columns]
     prev = prev[keep].copy()
+    for col in prev.columns:
+        prev[col] = prev[col].astype("object")
     prev["line_id"] = prev["line_id"].astype(str).str.strip()
     prev = prev[prev["line_id"] != ""]
     prev = prev.drop_duplicates(subset=["line_id"], keep="last")
@@ -242,14 +272,14 @@ def merge_with_enrichments(
     return fresh, stats
 
 
-def _step(num: int, msg: str) -> None:
+def _step(num: int | str, msg: str) -> None:
     print(f"\n{'='*60}")
     print(f"  Step {num}: {msg}")
     print(f"{'='*60}")
 
 
 def _odoo_source_ref() -> str:
-    return f"{ODOO_SOURCE_PROJECT}.{ODOO_SOURCE_DATASET}"
+    return f"{bq_dataset.ODOO_SOURCE_PROJECT}.{bq_dataset.ODOO_SOURCE_DATASET}"
 
 
 def _read_sql_template(path: Path) -> str:
@@ -289,13 +319,12 @@ GROUP BY payment_state
 def step1_pull_bigquery() -> pd.DataFrame:
     """Pull fresh Odoo PO data from BigQuery."""
     _step(1, "Pull fresh Odoo data from BigQuery")
-    from google.cloud import bigquery
 
     creator_names = _load_creator_names()
     print(f"  Creator filter: {len(creator_names)} people")
 
     print(f"  Odoo source: {_odoo_source_ref()}")
-    client = bigquery.Client(project=QUERY_PROJECT)
+    client = _get_bigquery_client()
 
     creator_sql = _format_creator_names_sql(creator_names)
     query_text = _render_sql(SQL_FILE, {"creator_names": creator_sql})
@@ -429,8 +458,8 @@ def step2_load_ramp() -> pd.DataFrame:
 
 
 def step3_load_stations() -> tuple[list[dict], list[dict]]:
-    """Load BF1 stations from Excel."""
-    _step(3, "Load BF1 stations from Excel")
+    """Load station master from planning Excel (BF1/BF2 when available)."""
+    _step(3, "Load station master from Excel")
     if not EXCEL_FILE.exists():
         print(f"  WARNING: Excel not found at {EXCEL_FILE}.")
         cached = store.read_json("bf1_stations.json")
@@ -700,11 +729,7 @@ def step6_concatenate(odoo: pd.DataFrame, ramp: pd.DataFrame) -> pd.DataFrame:
     for col in unified.columns:
         if pd.api.types.is_datetime64_any_dtype(unified[col]) or hasattr(unified[col], "dt"):
             unified[col] = unified[col].astype("object").where(unified[col].notna(), None)
-        else:
-            try:
-                unified[col] = unified[col].fillna("")
-            except (ValueError, TypeError):
-                unified[col] = unified[col].astype("object").where(unified[col].notna(), "")
+    unified = _safe_fillna(unified, "")
     print(f"  Unified rows: {len(unified)} (Odoo: {len(odoo)}, Ramp: {len(ramp)})")
     return unified
 
@@ -833,6 +858,23 @@ def step9_classify_subcategories(df: pd.DataFrame, *, incremental: bool = False)
     return df
 
 
+def _load_existing_ramp_rows() -> pd.DataFrame:
+    """Load existing ramp rows from the previous export so cloud refreshes don't lose them."""
+    existing = pd.DataFrame()
+    try:
+        existing = bq_dataset.read_table("po_lines")
+    except Exception:
+        pass
+    if existing.empty:
+        existing = store.read_csv("capex_clean.csv")
+    if existing.empty or "source" not in existing.columns:
+        return pd.DataFrame()
+    ramp = existing[existing["source"].astype(str) == "ramp"].copy()
+    for col in ramp.columns:
+        ramp[col] = ramp[col].astype("object")
+    return _safe_fillna(ramp, "")
+
+
 def _load_existing_manual_rows() -> pd.DataFrame:
     """Load existing manual rows from capex_clean.csv so re-exports preserve them."""
     existing = store.read_csv("capex_clean.csv")
@@ -841,7 +883,7 @@ def _load_existing_manual_rows() -> pd.DataFrame:
     manual = existing[existing["source"].astype(str) == "manual"].copy()
     if "line_type" in manual.columns:
         manual = manual[manual["line_type"] == "spend"]
-    return manual.fillna("")
+    return _safe_fillna(manual, "")
 
 
 def _load_forecast_overrides() -> dict[str, float]:
@@ -939,7 +981,8 @@ def step10_export(df: pd.DataFrame, stations: list[dict], *, write_bq: bool = Fa
         } for sid in missing])
         by_station = pd.concat([by_station, missing_rows], ignore_index=True)
 
-    by_station["station_name"] = by_station["station_id"].map(station_name_map).fillna("")
+    existing_station_names = by_station.get("station_name", pd.Series([""] * len(by_station)))
+    by_station["station_name"] = by_station["station_id"].map(station_name_map).fillna(existing_station_names).fillna("")
     by_station["owner"] = by_station["station_id"].map(station_owner_map).fillna("")
     by_station["forecasted_cost"] = by_station["station_id"].map(station_forecast_map).fillna(0)
     forecast_overrides = _load_forecast_overrides()
@@ -1042,7 +1085,6 @@ def step10_export(df: pd.DataFrame, stations: list[dict], *, write_bq: bool = Fa
     if write_bq:
         _step(10, "Writing to BigQuery (capex_analytics)")
         try:
-            import bq_dataset
             bq_dataset.ensure_all_tables()
 
             n = store.write_to_bigquery("capex_clean.csv", spend)
@@ -1151,6 +1193,14 @@ def main() -> None:
     odoo = step4_clean_odoo(odoo_raw)
     odoo = step4b_apply_payment_status_v2(odoo, payment_detail_df)
     ramp = step5_normalize_ramp(ramp_raw)
+
+    if ramp.empty and incremental:
+        print("\n  WARNING: No fresh Ramp data available. Preserving existing Ramp rows from previous export.")
+        existing_ramp = _load_existing_ramp_rows()
+        if not existing_ramp.empty:
+            ramp = existing_ramp
+            print(f"  Carried forward {len(ramp)} existing Ramp rows.")
+
     unified = step6_concatenate(odoo, ramp)
 
     merge_stats: dict[str, int] = {}

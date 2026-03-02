@@ -4,24 +4,17 @@ Uses Application Default Credentials (run: gcloud auth application-default login
 """
 from __future__ import annotations
 
-import os
+import bq_dataset
 
-from google.cloud import bigquery
-
-
-DEFAULT_ODOO_SOURCE_PROJECT = "gtm-analytics-447201"
-DEFAULT_ODOO_SOURCE_DATASET = "odoo_public"
-PROJECT_ID = os.environ.get("ODOO_SOURCE_PROJECT", DEFAULT_ODOO_SOURCE_PROJECT)
-DATASET = os.environ.get("ODOO_SOURCE_DATASET", DEFAULT_ODOO_SOURCE_DATASET)
-QUERY_PROJECT = os.environ.get("BQ_QUERY_PROJECT", PROJECT_ID)
 TABLE = "account_account"
 LIMIT = 1000
 
 
 def main() -> None:
-    client = bigquery.Client(project=QUERY_PROJECT)
+    client = bq_dataset.get_source_client()
+    fq_table = bq_dataset.source_table(TABLE)
     query = f"""
-        SELECT * FROM `{PROJECT_ID}.{DATASET}.{TABLE}`
+        SELECT * FROM {fq_table}
         LIMIT {LIMIT}
     """
     print(f"Running: {query.strip()}")

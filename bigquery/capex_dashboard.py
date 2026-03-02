@@ -6,7 +6,10 @@ Open: http://localhost:5050
 """
 from __future__ import annotations
 
+import os
+import time
 from pathlib import Path
+from threading import Lock
 
 import pandas as pd
 from flask import Flask, jsonify, render_template_string, request
@@ -33,8 +36,27 @@ init_auth(app)
 # Data loading -- delegates to storage_backend (local or GCS)
 # ---------------------------------------------------------------------------
 
+_CSV_CACHE_TTL_SEC = float(
+    os.environ.get("CSV_CACHE_TTL_SEC", "20" if store.is_remote() else "0")
+)
+_CSV_CACHE: dict[str, tuple[float, pd.DataFrame]] = {}
+_CSV_CACHE_LOCK = Lock()
+
+
 def _load_csv(name: str) -> pd.DataFrame:
-    return store.read_csv(name)
+    if _CSV_CACHE_TTL_SEC <= 0:
+        return store.read_csv(name)
+
+    now = time.time()
+    with _CSV_CACHE_LOCK:
+        cached = _CSV_CACHE.get(name)
+        if cached and (now - cached[0]) <= _CSV_CACHE_TTL_SEC:
+            return cached[1].copy(deep=True)
+
+    fresh = store.read_csv(name)
+    with _CSV_CACHE_LOCK:
+        _CSV_CACHE[name] = (now, fresh)
+    return fresh.copy(deep=True)
 
 
 def _load_stations_json() -> list[dict]:
@@ -523,13 +545,35 @@ def api_payment_evidence():
         vals = vals[vals != ""]
         return vals.iloc[0] if not vals.empty else default
 
+    def _num_max(group: pd.DataFrame, col: str, default: float = 0.0) -> float:
+        if col not in group.columns:
+            return float(default)
+        ser = pd.to_numeric(group[col], errors="coerce").fillna(default)
+        return float(ser.max() if len(ser) else default)
+
+    def _bool_any(group: pd.DataFrame, col: str) -> bool:
+        if col not in group.columns:
+            return False
+        ser = group[col]
+        try:
+            return bool(ser.fillna(False).astype(bool).any())
+        except Exception:
+            return bool(
+                ser.fillna("")
+                .astype(str)
+                .str.strip()
+                .str.lower()
+                .isin({"1", "true", "yes", "y"})
+                .any()
+            )
+
     rows: list[dict] = []
     for po, g in df.groupby("po_number"):
-        po_total = float(pd.to_numeric(g.get("po_amount_total", 0), errors="coerce").max() or 0.0)
+        po_total = _num_max(g, "po_amount_total", 0.0)
         spend_total = float(pd.to_numeric(g.get("price_subtotal", 0), errors="coerce").sum())
-        billed = float(pd.to_numeric(g.get("bill_amount_total_v2", 0), errors="coerce").max() or 0.0)
-        paid = float(pd.to_numeric(g.get("bill_amount_paid_v2", 0), errors="coerce").max() or 0.0)
-        open_amt = float(pd.to_numeric(g.get("bill_amount_open_v2", 0), errors="coerce").max() or 0.0)
+        billed = _num_max(g, "bill_amount_total_v2", 0.0)
+        paid = _num_max(g, "bill_amount_paid_v2", 0.0)
+        open_amt = _num_max(g, "bill_amount_open_v2", 0.0)
         rows.append({
             "po_number": str(po),
             "vendor_name": _first_nonempty(g.get("vendor_name", pd.Series(dtype=str))),
@@ -542,8 +586,8 @@ def api_payment_evidence():
             "paid_pct_of_po": (paid / po_total * 100) if po_total else 0.0,
             "status_v2": _first_nonempty(g.get(status_col, pd.Series(dtype=str)), "no_bill"),
             "confidence": _first_nonempty(g.get("payment_status_confidence", pd.Series(dtype=str))),
-            "has_unbilled_signal": bool(g.get("has_unbilled_payment_signal", pd.Series([False])).fillna(False).astype(bool).any()),
-            "has_deposit_signal": bool(g.get("has_deposit_signal", pd.Series([False])).fillna(False).astype(bool).any()),
+            "has_unbilled_signal": _bool_any(g, "has_unbilled_payment_signal"),
+            "has_deposit_signal": _bool_any(g, "has_deposit_signal"),
             "evidence_notes": _first_nonempty(g.get("payment_evidence_notes", pd.Series(dtype=str))),
         })
 
@@ -704,7 +748,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Mfg Budgeting App</title>
+<title>Base Power - Mfg Budgeting</title>
 <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
 <link rel="stylesheet" href="https://cdn.datatables.net/1.13.7/css/jquery.dataTables.min.css">
 <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
@@ -885,9 +929,57 @@ body.col-resize-active{cursor:col-resize;user-select:none}
 .about-details summary::-webkit-details-marker{display:none}
 .about-details-body{padding:0 12px 12px}
 @media(max-width:1200px){.about-rules{grid-template-columns:1fr}}
+.mobile-header{display:none;position:fixed;top:0;left:0;right:0;z-index:200;background:var(--surface);border-bottom:1px solid var(--border);padding:10px 16px;align-items:center;gap:12px}
+.mobile-header .hamburger{background:none;border:none;color:var(--green);font-size:22px;cursor:pointer;padding:4px 8px;line-height:1}
+.mobile-header .brand{font-size:14px;font-weight:700;color:var(--green);letter-spacing:.4px}
+.mobile-header .brand span{color:var(--muted);font-weight:400;font-size:11px;margin-left:6px;text-transform:uppercase;letter-spacing:.8px}
+.sidebar-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:299}
+@media(max-width:1024px){
+.sidebar{transform:translateX(-100%);z-index:300;transition:transform .25s ease;width:260px}
+.sidebar.open{transform:translateX(0)}
+.sidebar-overlay.visible{display:block}
+.mobile-header{display:flex}
+.main{margin-left:0;padding:68px 16px 24px}
+.chart-grid{grid-template-columns:1fr}
+.kpi-row{grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px}
+.page-title{font-size:17px}
+.page-subtitle{font-size:11px}
+.chart-card{padding:14px}
+.chart-card h3{font-size:11px;padding-right:0}
+.filter-bar{gap:8px}
+.filter-bar select,.filter-bar input{font-size:12px;padding:6px 10px}
+.about-grid{grid-template-columns:1fr}
+.about-flow-row{flex-direction:column}
+.about-arrow{transform:rotate(90deg);text-align:center}
+.about-journey{flex-direction:column}
+.about-rules{grid-template-columns:1fr}
+.about-metric-grid{grid-template-columns:repeat(auto-fit,minmax(160px,1fr))}
+.detail-native-toolbar{flex-direction:column;align-items:stretch}
+.detail-native-search{min-width:unset;width:100%}
+.station-select{min-width:unset;width:100%}
+}
+@media(max-width:600px){
+.main{padding:64px 10px 20px}
+.kpi-row{grid-template-columns:1fr 1fr;gap:8px}
+.kpi{padding:12px 14px}
+.kpi .value{font-size:18px}
+.kpi .label{font-size:9px}
+.chart-card{padding:10px;border-radius:8px}
+.page-header{flex-direction:column;align-items:flex-start;gap:4px}
+table.dataTable thead th{font-size:10px!important;padding:6px 4px!important}
+table.dataTable tbody td{font-size:11px!important;padding:6px 4px!important}
+.toast{bottom:12px;right:12px;left:12px;text-align:center}
+.forecast-input{width:80px;font-size:11px}
+}
 </style>
 </head>
 <body>
+
+<div class="mobile-header">
+    <button class="hamburger" onclick="toggleSidebar()" aria-label="Menu">&#9776;</button>
+    <div class="brand">MFG BUDGETING<span>Base Power</span></div>
+</div>
+<div class="sidebar-overlay" onclick="toggleSidebar()"></div>
 
 <div class="sidebar">
     <div class="sidebar-brand"><h2>MFG BUDGETING</h2><div class="sub">Base Power Company</div></div>
@@ -999,7 +1091,7 @@ body.col-resize-active{cursor:col-resize;user-select:none}
                     <li><strong>Milestone Templates</strong>: expected payment plans by PO.</li>
                     <li><strong>Cashflow Forecast</strong>: actual paid vs projected outflow.</li>
                 </ul>
-            </div>
+        </div>
             <div class="about-card">
                 <h4>Admin</h4>
                 <ul>
@@ -1007,24 +1099,24 @@ body.col-resize-active{cursor:col-resize;user-select:none}
                     <li><strong>Classification Review</strong>: resolve AI/rules mismatches.</li>
                     <li><strong>About &amp; Operating Guide</strong>: workflow, trust model, limitations.</li>
                 </ul>
-            </div>
+    </div>
         </div>
     </div>
 
     <div class="chart-card full" style="margin-bottom:14px">
         <h3>Data Flow (High Level)</h3>
-        <div class="about-flow">
-            <div class="about-flow-row">
+            <div class="about-flow">
+                <div class="about-flow-row">
                 <div class="about-node"><h5>Inputs</h5><p>Odoo PO + billing/payment context, Ramp spend feed, manual additions, and settings controls.</p></div>
-                <div class="about-arrow">&#8594;</div>
+                    <div class="about-arrow">&#8594;</div>
                 <div class="about-node"><h5>Processing</h5><p>Cleanup, dedupe, station mapping, subcategory classification, and payment status reconciliation.</p></div>
-                <div class="about-arrow">&#8594;</div>
+                    <div class="about-arrow">&#8594;</div>
                 <div class="about-node"><h5>Outputs</h5><p>Unified analytics tables that power dashboard charts, drilldowns, and exportable tables.</p></div>
-                <div class="about-arrow">&#8594;</div>
+                    <div class="about-arrow">&#8594;</div>
                 <div class="about-node"><h5>Planning Layer</h5><p>Template milestones + actual payment events roll into timeline and cashflow forecasts.</p></div>
+                </div>
             </div>
         </div>
-    </div>
 
     <div class="about-rules">
         <div class="about-card">
@@ -1035,8 +1127,8 @@ body.col-resize-active{cursor:col-resize;user-select:none}
                 <div class="about-step"><div class="num">3</div><div class="body"><strong>Review classification</strong>Use <code>Classification Review</code> to accept/fix mismatches and improve future runs.</div></div>
                 <div class="about-step"><div class="num">4</div><div class="body"><strong>Maintain templates</strong>Keep <code>Milestone Templates</code> aligned to expected payment terms for major POs.</div></div>
                 <div class="about-step"><div class="num">5</div><div class="body"><strong>Publish forecast</strong>Use <code>Cashflow Forecast</code> + drilldowns and export snapshots for stakeholder reporting.</div></div>
-            </div>
         </div>
+    </div>
 
         <div class="about-card">
             <h4>Data Trust Model</h4>
@@ -1046,25 +1138,25 @@ body.col-resize-active{cursor:col-resize;user-select:none}
                 <li><strong>Scenario confidence</strong>: projected cashflow from templates and expected dates.</li>
                 <li><strong>Control point</strong>: human edits and review decisions always take precedence over auto output.</li>
             </ul>
-            <details class="about-details">
+        <details class="about-details">
                 <summary>Show technical reference</summary>
-                <div class="about-details-body">
-                    <table class="about-tech-table">
-                        <thead>
+            <div class="about-details-body">
+                <table class="about-tech-table">
+                    <thead>
                             <tr><th>Layer</th><th>Key logic</th><th>Purpose</th></tr>
-                        </thead>
-                        <tbody>
+                    </thead>
+                    <tbody>
                             <tr><td>Extract</td><td><span class="about-code">po_by_creators_last_7m.sql</span></td><td>Scoping by configured creators and recent date window.</td></tr>
                             <tr><td>Cleanup</td><td><span class="about-code">step4_clean_odoo()</span></td><td>Standardized text/date/amount fields for consistent analytics.</td></tr>
                             <tr><td>Mapping</td><td><span class="about-code">step7_map_stations()</span></td><td>Station assignment and confidence scoring.</td></tr>
                             <tr><td>Overrides</td><td><span class="about-code">step8_apply_overrides()</span></td><td>Human corrections override auto mappings.</td></tr>
                             <tr><td>Classification</td><td><span class="about-code">step9_classify_subcategories()</span></td><td>Manufacturing subcategory assignment.</td></tr>
                             <tr><td>Export</td><td><span class="about-code">step10_export()</span></td><td>Materialized outputs used by dashboard APIs.</td></tr>
-                        </tbody>
-                    </table>
-                </div>
-            </details>
-        </div>
+                    </tbody>
+                </table>
+            </div>
+        </details>
+    </div>
     </div>
 </div>
 
@@ -1235,7 +1327,7 @@ body.col-resize-active{cursor:col-resize;user-select:none}
     </div>
     <div class="kpi-row" id="milestone-kpis"></div>
     <div id="milestone-note" style="margin:0 20px 12px;padding:10px 12px;background:var(--surface2);border:1px solid var(--border);border-radius:8px;font-size:11px;color:var(--muted)"></div>
-    <div class="chart-card full"><h3>PO Payment Timeline</h3><div id="chart-po-timeline" style="min-height:400px"></div></div>
+    <div class="chart-card full"><h3>PO Payment Timeline</h3><div id="chart-po-timeline" style="min-height:500px;max-height:80vh;overflow-y:auto"></div></div>
     <div class="chart-card full"><h3>PO Payment Ledger (Raw Events)</h3><div id="vendor-profile-table-wrap" style="overflow-x:auto"></div></div>
     <div class="chart-card full"><h3>Vendor Payment Profiles</h3><div id="line-profile-table-wrap" style="overflow-x:auto"></div></div>
 </div>
@@ -1577,7 +1669,7 @@ body.col-resize-active{cursor:col-resize;user-select:none}
     </div>
     <div style="margin-top:16px;display:flex;gap:10px;align-items:center;padding:0 20px">
         <button id="btn-save-settings" class="btn-refresh" style="width:auto;padding:10px 24px" onclick="saveSettings()">Save All Settings</button>
-        <span id="settings-ok" class="forecast-saved" style="display:none">Settings saved</span>
+            <span id="settings-ok" class="forecast-saved" style="display:none">Settings saved</span>
     </div>
 </div>
 
@@ -2188,11 +2280,28 @@ function closeDrill(){
     if(drillDT){drillDT.destroy();drillDT=null;}
 }
 
+function toggleSidebar(){
+    const sb=document.querySelector('.sidebar');
+    const ov=document.querySelector('.sidebar-overlay');
+    const open=sb.classList.toggle('open');
+    ov.classList.toggle('visible',open);
+    document.body.style.overflow=open?'hidden':'';
+}
+function closeSidebarIfMobile(){
+    if(window.innerWidth<=1024){
+        const sb=document.querySelector('.sidebar');
+        const ov=document.querySelector('.sidebar-overlay');
+        sb.classList.remove('open');
+        ov.classList.remove('visible');
+        document.body.style.overflow='';
+    }
+}
 function showPage(id,el){
     document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
     document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));
     document.getElementById('page-'+id).classList.add('active');
     if(el)el.classList.add('active');
+    closeSidebarIfMobile();
     if(id==='about')loadAbout();
     if(id==='source')loadSource();
     if(id==='stations'&&!document.getElementById('stationSelect').value)loadStations();
@@ -3271,18 +3380,21 @@ async function loadReviews(){
     }
     const SUBCATS=['Process Equipment','Controls & Electrical','Mechanical & Structural','Consumables','MFG Tools & Shop Supplies','Design & Engineering Services','Integration & Commissioning','Quality & Metrology','Software & Licenses','Shipping & Freight','Facilities & Office','IT Equipment','General & Administrative'];
     reviews.sort((a,b)=>(b.price_subtotal||0)-(a.price_subtotal||0));
-    let html='<table class="display" id="review-tbl" style="width:100%"><thead><tr><th>PO / Source</th><th>Vendor</th><th>Item Detail</th><th>Amount</th><th>Rule</th><th>LLM Suggestion</th><th>Actions</th></tr></thead><tbody>';
+    let html='<table class="display" id="review-tbl" style="width:100%"><thead><tr><th>PO</th><th>PO Date</th><th>Vendor</th><th>Item Detail</th><th>Amount</th><th>Rule</th><th>LLM Suggestion</th><th>Actions</th></tr></thead><tbody>';
     reviews.forEach((r,idx)=>{
         const esc=s=>(s||'').replace(/'/g,"\\'").replace(/"/g,'&quot;');
-        const poInfo=`<span style="font-weight:600;color:var(--green)">${r.po_number||''}</span><br><span style="font-size:10px;color:var(--muted)">${r.source||'odoo'} | ${(r.date_order||'').slice(0,10)}</span>`;
+        const poInfo=`<span style="font-weight:600;color:var(--green)">${r.po_number||''}</span><br><span style="font-size:10px;color:var(--muted)">${r.source||'odoo'}</span>`;
+        const rawDate=(r.date_order||'').slice(0,10);
+        const sortDate=rawDate||'';
         const itemDetail=`<div style="font-size:12px;max-width:300px"><div style="margin-bottom:2px" title="${esc(r.item_description)}">${r.item_description||''}</div><div style="font-size:10px;color:var(--muted)">Project: ${r.project_name||'--'}</div><div style="font-size:10px;color:var(--muted)">Category: ${r.product_category||'--'}</div></div>`;
         const ruleInfo=`${r.rule_subcat||'?'}<br><span style="font-size:10px;color:var(--muted)">station: ${r.rule_station||'none'}</span><br><span style="font-size:10px;color:var(--muted)">${r.rule_mapping_status||''}</span>`;
         const llmInfo=`<span style="color:var(--green);font-weight:600">${r.llm_subcat||'?'}</span><br><span style="font-size:10px;color:var(--muted)">station: ${r.llm_station||'none'}</span><br><span style="font-size:10px;color:var(--muted)">${r.llm_reasoning||''}</span>`;
         html+=`<tr id="rv-row-${idx}">
             <td style="font-size:12px">${poInfo}</td>
+            <td data-order="${sortDate}" style="font-size:12px;white-space:nowrap">${rawDate?fmtDateMMDDYYYY(rawDate):'--'}</td>
             <td style="font-weight:600">${r.vendor_name||''}</td>
             <td>${itemDetail}</td>
-            <td style="text-align:right">${fmt$(r.price_subtotal||0)}</td>
+            <td style="text-align:right" data-order="${r.price_subtotal||0}">${fmt$(r.price_subtotal||0)}</td>
             <td style="font-size:12px">${ruleInfo}</td>
             <td style="font-size:12px">${llmInfo}</td>
             <td style="min-width:280px">
@@ -3302,7 +3414,7 @@ async function loadReviews(){
     html+='</tbody></table>';
     document.getElementById('review-table-wrap').innerHTML=html;
     if(dtI['review-tbl'])dtI['review-tbl'].destroy();
-    dtI['review-tbl']=$('#review-tbl').DataTable(dtOpts({pageLength:25,order:[[3,'desc']],columnDefs:[{orderable:false,targets:6}]}));
+    dtI['review-tbl']=$('#review-tbl').DataTable(dtOpts({pageLength:25,order:[[1,'desc']],columnDefs:[{orderable:false,targets:7}]}));
 }
 async function submitReview(reviewId,decision,stationId,subcat,idx){
     const row=document.getElementById('rv-row-'+idx);
@@ -3346,10 +3458,10 @@ async function loadMilestones(){
     document.getElementById('milestone-note').innerHTML='All events shown here are <strong>actual observed payments</strong> from Odoo bill/payment history. "Final" is marked only when cumulative paid amount reaches the PO amount (with small tolerance); otherwise latest row is not final.';
 
     if(withPay.length){
-        const top30=withPay.sort((a,b)=>(b.total_amount||0)-(a.total_amount||0)).slice(0,30);
+        const allPOs=withPay.sort((a,b)=>(b.total_amount||0)-(a.total_amount||0));
         const traces=[];
         const MS_DAY=24*60*60*1000;
-        top30.forEach((t,i)=>{
+        allPOs.forEach((t,i)=>{
             const start=t.po_date?new Date(t.po_date):null;
             if(!start)return;
             const events=(t.milestones||[])
@@ -3386,7 +3498,10 @@ async function loadMilestones(){
                 });
             });
         });
-        Plotly.newPlot('chart-po-timeline',traces,{...PL,height:Math.max(400,top30.length*28),margin:{l:280,r:40,t:20,b:40},yaxis:{...PL.yaxis,autorange:'reversed'},xaxis:{...PL.xaxis,type:'date'}},PC);
+        const chartH=Math.max(500,allPOs.length*30);
+        document.getElementById('chart-po-timeline').style.height=chartH+'px';
+        document.getElementById('chart-po-timeline').style.overflowY='auto';
+        Plotly.newPlot('chart-po-timeline',traces,{...PL,height:chartH,margin:{l:280,r:40,t:20,b:40},yaxis:{...PL.yaxis,autorange:'reversed'},xaxis:{...PL.xaxis,type:'date'}},{...PC,scrollZoom:true});
         document.getElementById('chart-po-timeline').on('plotly_click',function(ev){
             if(!ev.points||!ev.points.length)return;
             const label=ev.points[0].y||'';
@@ -4226,7 +4341,7 @@ function renderAirRfqPreview(preview){
 async function loadAirRfq(forceLive){
     try{
         const isForce=Boolean(forceLive);
-        setAirRfqStatus(isForce?'Refreshing BQ lookup cache...':'Loading lookup values...','var(--muted)');
+        setAirRfqStatus(isForce?'Refreshing lookup cache...':'Loading lookup values...','var(--muted)');
         const qs=isForce?'?mode=bq_only&force_refresh=1':'?mode=bq_only';
         const res=await fetch('/api/v2/ai-rfq/lookups'+qs);
         const d=await res.json();
@@ -4274,10 +4389,14 @@ async function generateAirRfq(isRegenerate){
     startAirRfqProgress(isRegenerate?'Regenerating':'Generating');
     const startedAt=Date.now();
     try{
+        const headerDeliver=(document.getElementById('airfq-header-deliver').value||'').trim();
+        const headerProject=(document.getElementById('airfq-header-project').value||'').trim();
         const form=new FormData();
         form.append('vendor',vendor||airfqState.revisionContext?.vendor||'');
         form.append('prompt',prompt);
         form.append('payment_milestones_note',paymentNote);
+        if(headerDeliver)form.append('deliver_to',headerDeliver);
+        if(headerProject)form.append('header_project',headerProject);
         if(airfqState.revisionContext)form.append('prior_context',JSON.stringify(airfqState.revisionContext));
         if(file)form.append('file',file);
         const res=await fetch(endpoint,{method:'POST',body:form});

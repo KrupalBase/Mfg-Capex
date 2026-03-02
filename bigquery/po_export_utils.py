@@ -361,7 +361,10 @@ OVERALL_INTEGRATION_KEYWORDS: list[str] = [
 # ---------------------------------------------------------------------------
 
 def load_bf1_stations(xlsx_path: str | Path) -> tuple[list[dict], list[dict]]:
-    """Load station list and cost breakdown from the BF1 planning Excel.
+    """Load station list and cost breakdown from planning Excel sheets.
+
+    Backward-compatible name: this now scans all "* PROD Overall" and
+    "* PROD Cost Breakdown" sheets (e.g., BF1 + BF2) when present.
 
     Returns (stations, cost_breakdown) where each is a list of dicts.
     """
@@ -369,39 +372,60 @@ def load_bf1_stations(xlsx_path: str | Path) -> tuple[list[dict], list[dict]]:
 
     wb = openpyxl.load_workbook(str(xlsx_path), read_only=True, data_only=True)
 
-    stations: list[dict] = []
-    ws_overall = wb["BF1 PROD Overall"]
-    rows = list(ws_overall.iter_rows(values_only=True))
-    for row in rows[1:]:
-        sid = str(row[0]).strip() if row[0] else ""
-        if not sid or not sid.startswith("BASE"):
-            continue
-        stations.append({
-            "station_id": sid,
-            "process_name": str(row[1]).strip() if row[1] else "",
-            "station_type": str(row[2]).strip() if row[2] else "",
-            "owner": str(row[4]).strip() if row[4] else "",
-            "vendor": str(row[6]).strip() if row[6] else "",
-            "status": str(row[10]).strip() if row[10] else "",
-            "forecasted_cost": float(row[11]) if row[11] is not None else 0.0,
-        })
+    station_map: dict[str, dict] = {}
+    overall_sheets = [name for name in wb.sheetnames if name.upper().endswith("PROD OVERALL")]
+    if "BF1 PROD Overall" in wb.sheetnames and "BF1 PROD Overall" not in overall_sheets:
+        overall_sheets.append("BF1 PROD Overall")
+
+    for sheet_name in overall_sheets:
+        ws_overall = wb[sheet_name]
+        rows = list(ws_overall.iter_rows(values_only=True))
+        for row in rows[1:]:
+            sid = str(row[0]).strip() if row[0] else ""
+            if not sid or not sid.startswith("BASE"):
+                continue
+            rec = {
+                "station_id": sid,
+                "process_name": str(row[1]).strip() if row[1] else "",
+                "station_type": str(row[2]).strip() if row[2] else "",
+                "owner": str(row[4]).strip() if row[4] else "",
+                "vendor": str(row[6]).strip() if row[6] else "",
+                "status": str(row[10]).strip() if row[10] else "",
+                "forecasted_cost": float(row[11]) if row[11] is not None else 0.0,
+            }
+            if sid not in station_map:
+                station_map[sid] = rec
+            else:
+                # Merge sparse values from additional sheets without clobbering useful data.
+                existing = station_map[sid]
+                for key in ("process_name", "station_type", "owner", "vendor", "status"):
+                    if not existing.get(key) and rec.get(key):
+                        existing[key] = rec[key]
+                if float(existing.get("forecasted_cost", 0.0) or 0.0) == 0.0 and float(rec.get("forecasted_cost", 0.0) or 0.0) != 0.0:
+                    existing["forecasted_cost"] = rec["forecasted_cost"]
+
+    stations: list[dict] = sorted(station_map.values(), key=lambda x: str(x.get("station_id", "")))
 
     cost_breakdown: list[dict] = []
-    ws_cb = wb["BF1 PROD Cost Breakdown"]
-    cb_rows = list(ws_cb.iter_rows(values_only=True))
-    for row in cb_rows[1:]:
-        sid = str(row[0]).strip() if row[0] else ""
-        if not sid or not sid.startswith("BASE"):
-            continue
-        cost_breakdown.append({
-            "station_id": sid,
-            "process_name": str(row[1]).strip() if row[1] else "",
-            "equipment": str(row[2]).strip() if row[2] else "",
-            "owner": str(row[3]).strip() if row[3] else "",
-            "unit_cost": float(row[5]) if row[5] is not None else 0.0,
-            "total_cost": float(row[6]) if row[6] is not None else 0.0,
-            "vendor": str(row[8]).strip() if row[8] else "",
-        })
+    cost_sheets = [name for name in wb.sheetnames if name.upper().endswith("PROD COST BREAKDOWN")]
+    if "BF1 PROD Cost Breakdown" in wb.sheetnames and "BF1 PROD Cost Breakdown" not in cost_sheets:
+        cost_sheets.append("BF1 PROD Cost Breakdown")
+    for sheet_name in cost_sheets:
+        ws_cb = wb[sheet_name]
+        cb_rows = list(ws_cb.iter_rows(values_only=True))
+        for row in cb_rows[1:]:
+            sid = str(row[0]).strip() if row[0] else ""
+            if not sid or not sid.startswith("BASE"):
+                continue
+            cost_breakdown.append({
+                "station_id": sid,
+                "process_name": str(row[1]).strip() if row[1] else "",
+                "equipment": str(row[2]).strip() if row[2] else "",
+                "owner": str(row[3]).strip() if row[3] else "",
+                "unit_cost": float(row[5]) if row[5] is not None else 0.0,
+                "total_cost": float(row[6]) if row[6] is not None else 0.0,
+                "vendor": str(row[8]).strip() if row[8] else "",
+            })
 
     wb.close()
     return stations, cost_breakdown
@@ -834,6 +858,62 @@ def _project_allows_base2(project_name: str) -> bool:
     return ("BASE2" in p) or ("BF2" in p) or ("CIP-BF2-" in p)
 
 
+def _station_id_from_cip_project(project_name: str) -> tuple[str, str]:
+    """Extract canonical station_id from CIP project text.
+
+    Example:
+      CIP-BF2-MOD3-ST33000-03 : Enclosure Weld -> (BASE2-MOD3-ST33000-03, Enclosure Weld)
+    """
+    proj = str(project_name or "").strip()
+    if not proj:
+        return "", ""
+    head, sep, tail = proj.partition(" : ")
+    code = head.strip().upper()
+    m = re.match(r"^CIP-BF(\d+)-(.+)$", code)
+    if not m:
+        return "", ""
+    sid = f"BASE{m.group(1)}-{m.group(2).strip()}"
+    process_name = tail.strip() if sep else ""
+    return sid, process_name
+
+
+def _line_prefixes_for_project(project_name: str) -> list[str]:
+    """Get preferred production line prefixes from project_name hints."""
+    proj = str(project_name or "").strip()
+    prefixes: list[str] = list(PROJECT_TO_LINE_PREFIX.get(proj, []))
+
+    # Generic CIP route (works for BF1, BF2, ...).
+    sid, _ = _station_id_from_cip_project(proj)
+    if sid:
+        parts = sid.split("-")
+        if len(parts) >= 2:
+            base = parts[0]
+            unit = parts[1]
+            prefixes.append(f"{base}-{unit}")
+            cell_match = re.match(r"^CELL(\d+)$", unit, re.IGNORECASE)
+            if cell_match:
+                prefixes.append(f"{base}-MOD{cell_match.group(1)}")
+
+    # Optional human-readable project labels beyond BF1 defaults.
+    m_mod = re.match(r"^BF(\d+)-MODULE\s+LINE\s+(\d+)$", proj.upper())
+    if m_mod:
+        base = f"BASE{m_mod.group(1)}"
+        mod = m_mod.group(2)
+        prefixes.extend([f"{base}-MOD{mod}", f"{base}-CELL{mod}"])
+    m_inv = re.match(r"^BF(\d+)-INVERTER\s+LINE\s+(\d+)$", proj.upper())
+    if m_inv:
+        prefixes.append(f"BASE{m_inv.group(1)}-INV{m_inv.group(2)}")
+
+    # Deduplicate while preserving order.
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for pfx in prefixes:
+        if pfx and pfx not in seen:
+            seen.add(pfx)
+            deduped.append(pfx)
+    return deduped
+
+
 def auto_map_stations(
     df: pd.DataFrame,
     stations: list[dict],
@@ -917,10 +997,9 @@ def auto_map_stations(
             result_reason.append("non_prod: ramp no project -> other allocation")
             continue
 
-        # --- Tier 1: Direct CIP project mapping ---
-        if proj.startswith("CIP-BF1-"):
-            code = proj.split(" : ")[0]
-            sid = code.replace("CIP-BF1-", "BASE1-")
+        # --- Tier 1: Direct CIP project mapping (BF1/BF2/...) ---
+        sid, inferred_station_name = _station_id_from_cip_project(proj)
+        if sid:
             if sid in station_ids_set:
                 result_station_id.append(sid)
                 result_station_name.append(station_name_map.get(sid, ""))
@@ -936,14 +1015,14 @@ def auto_map_stations(
                     break
             else:
                 result_station_id.append(sid)
-                result_station_name.append(station_name_map.get(sid, code))
+                result_station_name.append(station_name_map.get(sid, inferred_station_name or sid))
                 result_confidence.append("medium")
                 result_reason.append(f"CIP project (station not in master): {proj}")
                 continue
             continue
 
         # --- Tier 2: Scored matching (vendor + project-line + keywords) ---
-        line_prefixes: list[str] = PROJECT_TO_LINE_PREFIX.get(proj, [])
+        line_prefixes: list[str] = _line_prefixes_for_project(proj)
         candidates: dict[str, int] = {}
 
         vendor_stations = _fuzzy_vendor_match(vendor, vendor_lookup)

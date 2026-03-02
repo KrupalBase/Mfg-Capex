@@ -25,6 +25,7 @@ import pandas as pd
 from flask import Flask, jsonify, request
 
 from access_control import current_user_email, get_access_context, load_settings_with_access_defaults
+from auth import get_google_access_token
 import storage_backend as store
 
 
@@ -41,6 +42,9 @@ def register_v2_routes(app: Flask) -> None:
     refresh_timeout_sec = _int_env("REFRESH_TIMEOUT_SEC", 300)
     refresh_job_poll_sec = max(2, _int_env("REFRESH_JOB_POLL_SEC", 10))
     refresh_job_max_wait_sec = max(60, _int_env("REFRESH_JOB_MAX_WAIT_SEC", 2100))
+    refresh_use_logged_in_oauth = str(
+        os.environ.get("REFRESH_USE_LOGGED_IN_OAUTH", "true") or "true"
+    ).strip().lower() in {"1", "true", "yes", "y"}
     refresh_execution_mode = str(os.environ.get("REFRESH_EXECUTION_MODE", "subprocess") or "subprocess").strip().lower()
     refresh_job_name = str(os.environ.get("REFRESH_JOB_NAME", "capex-refresh-job") or "capex-refresh-job").strip()
     refresh_job_region = str(
@@ -64,6 +68,7 @@ def register_v2_routes(app: Flask) -> None:
         "last_error": "",
         "last_counts": {"new": 0, "updated": 0, "removed": 0},
         "last_mode": "",
+        "last_auth_mode": "",
         "last_operation_name": "",
     }
 
@@ -80,9 +85,11 @@ def register_v2_routes(app: Flask) -> None:
             "last_error": str(refresh_state.get("last_error", "") or ""),
             "last_counts": dict(refresh_state.get("last_counts", {}) or {}),
             "last_mode": str(refresh_state.get("last_mode", "") or ""),
+            "last_auth_mode": str(refresh_state.get("last_auth_mode", "") or ""),
             "last_operation_name": str(refresh_state.get("last_operation_name", "") or ""),
             "cooldown_sec": refresh_cooldown_sec,
             "execution_mode": refresh_execution_mode,
+            "refresh_use_logged_in_oauth": refresh_use_logged_in_oauth,
             "job_name": refresh_job_name,
         }
 
@@ -221,8 +228,6 @@ def register_v2_routes(app: Flask) -> None:
         return filtered
 
     def _rfq_settings() -> dict[str, object]:
-        import storage_backend as store
-
         raw = store.read_json("dashboard_settings.json")
         cfg = raw if isinstance(raw, dict) else {}
         cfg["rfq_validation_mode"] = "bq_only"
@@ -230,8 +235,6 @@ def register_v2_routes(app: Flask) -> None:
         return cfg
 
     def _require_settings_editor():
-        import storage_backend as store
-
         user_email = current_user_email()
         settings, changed = load_settings_with_access_defaults(bootstrap_user_email=user_email)
         if changed:
@@ -245,9 +248,7 @@ def register_v2_routes(app: Flask) -> None:
         if not raw:
             return {}
         try:
-            import json as _json
-
-            parsed = _json.loads(raw)
+            parsed = json.loads(raw)
             return parsed if isinstance(parsed, dict) else {}
         except Exception:
             return {}
@@ -331,20 +332,29 @@ def register_v2_routes(app: Flask) -> None:
             import bq_dataset
             df = bq_dataset.read_table(
                 "classification_reviews",
-                where="human_decision IS NULL",
+                where="human_decision IS NULL OR TRIM(CAST(human_decision AS STRING)) = ''",
             )
-            rows = df.to_dict(orient="records") if not df.empty else []
+            if not df.empty:
+                for col in df.columns:
+                    dtype = df[col].dtype
+                    if hasattr(dtype, "name") and dtype.name in ("Int8","Int16","Int32","Int64","UInt8","UInt16","UInt32","UInt64"):
+                        df[col] = df[col].astype("float64").fillna(0)
+                    elif pd.api.types.is_float_dtype(dtype):
+                        df[col] = df[col].fillna(0)
+                    elif pd.api.types.is_datetime64_any_dtype(dtype):
+                        df[col] = df[col].astype("object").where(df[col].notna(), None)
+                        df[col] = df[col].apply(lambda v: v.isoformat() if hasattr(v, "isoformat") else "")
+                    elif dtype == "object":
+                        df[col] = df[col].fillna("")
+                rows = df.to_dict(orient="records")
         except Exception:
             pass
 
         if not rows:
-            import storage_backend as store
-            import json as _json
-            from pathlib import Path
             local_path = Path(store.local_data_dir()) / "classification_reviews.json"
             if local_path.exists():
                 try:
-                    raw = _json.loads(local_path.read_text(encoding="utf-8"))
+                    raw = json.loads(local_path.read_text(encoding="utf-8"))
                     if isinstance(raw, list):
                         rows = [r for r in raw if not r.get("human_decision")]
                 except Exception:
@@ -356,12 +366,6 @@ def register_v2_routes(app: Flask) -> None:
     def v2_submit_feedback():
         """Submit a human decision on a classification disagreement."""
         try:
-            import uuid
-            import json as _json
-            from datetime import datetime, timezone
-            from pathlib import Path
-            import storage_backend as store
-
             body = request.get_json(force=True)
             review_id = body.get("review_id", "")
             decision = body.get("decision", "")
@@ -392,22 +396,22 @@ def register_v2_routes(app: Flask) -> None:
             existing = []
             if feedback_path.exists():
                 try:
-                    existing = _json.loads(feedback_path.read_text(encoding="utf-8"))
+                    existing = json.loads(feedback_path.read_text(encoding="utf-8"))
                 except Exception:
                     existing = []
             existing.append(entry)
-            feedback_path.write_text(_json.dumps(existing, indent=2, default=str), encoding="utf-8")
+            feedback_path.write_text(json.dumps(existing, indent=2, default=str), encoding="utf-8")
 
             reviews_path = Path(store.local_data_dir()) / "classification_reviews.json"
             if reviews_path.exists():
                 try:
-                    reviews = _json.loads(reviews_path.read_text(encoding="utf-8"))
+                    reviews = json.loads(reviews_path.read_text(encoding="utf-8"))
                     for rv in reviews:
                         if rv.get("review_id") == review_id:
                             rv["human_decision"] = decision
                             rv["reviewed_by"] = reviewed_by
                             rv["reviewed_at"] = now
-                    reviews_path.write_text(_json.dumps(reviews, indent=2, default=str), encoding="utf-8")
+                    reviews_path.write_text(json.dumps(reviews, indent=2, default=str), encoding="utf-8")
                 except Exception:
                     pass
 
@@ -449,7 +453,6 @@ def register_v2_routes(app: Flask) -> None:
             rows = df.to_dict(orient="records") if not df.empty else []
             return jsonify({"payments": rows, "count": len(rows)})
         except Exception:
-            import storage_backend as store
             df = store.read_csv("payment_details.csv")
             rows = df.to_dict(orient="records") if not df.empty else []
             return jsonify({"payments": rows, "count": len(rows)})
@@ -501,7 +504,6 @@ def register_v2_routes(app: Flask) -> None:
     @app.route("/api/v2/po-list")
     def v2_po_list():
         """Return distinct POs with total amounts for the template PO picker."""
-        import storage_backend as store
         df = store.read_csv("capex_clean.csv")
         if df.empty or "po_number" not in df.columns:
             return jsonify({"pos": []})
@@ -520,8 +522,6 @@ def register_v2_routes(app: Flask) -> None:
     @app.route("/api/v2/payment-templates")
     def v2_payment_templates():
         """Return all payment templates (local JSON is the source of truth)."""
-        import storage_backend as store
-
         raw = store.read_json("payment_templates.json")
         templates = raw if isinstance(raw, list) else []
         return jsonify({"templates": templates, "count": len(templates)})
@@ -530,12 +530,9 @@ def register_v2_routes(app: Flask) -> None:
     def v2_save_template():
         """Create or update a payment template linked to a specific PO."""
         try:
-            import storage_backend as store
-            import json as _json
-
             body = request.get_json(force=True)
-            template_id = body.get("template_id") or str(__import__("uuid").uuid4())
-            now = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat()
+            template_id = body.get("template_id") or str(uuid.uuid4())
+            now = datetime.now(timezone.utc).isoformat()
 
             existing = store.read_json("payment_templates.json")
             if not isinstance(existing, list):
@@ -582,7 +579,7 @@ def register_v2_routes(app: Flask) -> None:
                     "template_id": template_id,
                     "name": template["name"],
                     "description": f"PO: {template['po_number']}",
-                    "milestones_json": _json.dumps(template["milestones"]),
+                    "milestones_json": json.dumps(template["milestones"]),
                     "vendor_name": template["vendor_name"],
                     "line_prefix": "",
                     "created_by": "dashboard",
@@ -600,8 +597,6 @@ def register_v2_routes(app: Flask) -> None:
     def v2_delete_template(template_id: str):
         """Delete a payment template by ID."""
         try:
-            import storage_backend as store
-
             existing = store.read_json("payment_templates.json")
             if not isinstance(existing, list):
                 return jsonify({"error": "No templates found"}), 404
@@ -672,7 +667,6 @@ def register_v2_routes(app: Flask) -> None:
         """
         import subprocess
         import sys
-        from pathlib import Path
 
         denied = _require_settings_editor()
         if denied:
@@ -703,19 +697,33 @@ def register_v2_routes(app: Flask) -> None:
             }), 409
 
         run_id = uuid.uuid4().hex
+        user_access_token = ""
+        if refresh_use_logged_in_oauth:
+            try:
+                user_access_token = str(get_google_access_token() or "").strip()
+            except Exception:
+                user_access_token = ""
+
+        # If we have a signed-in user token, force subprocess mode so Odoo pulls
+        # execute under that user context instead of the Cloud Run Job service account.
+        effective_mode = "subprocess" if user_access_token else refresh_execution_mode
+
         refresh_state["running"] = True
         refresh_state["last_run_id"] = run_id
         refresh_state["last_started_at"] = _now_iso()
         refresh_state["last_error"] = ""
-        refresh_state["last_mode"] = refresh_execution_mode
+        refresh_state["last_mode"] = effective_mode
+        refresh_state["last_auth_mode"] = "user_oauth" if user_access_token else "service_account"
         refresh_state["last_operation_name"] = ""
 
         base_dir = Path(__file__).resolve().parent
         pipeline_path = base_dir / "capex_pipeline.py"
-        venv_python = base_dir / "venv" / "Scripts" / "python.exe"
+        venv_win = base_dir / "venv" / "Scripts" / "python.exe"
+        venv_unix = base_dir / "venv" / "bin" / "python"
+        venv_python = venv_win if venv_win.exists() else venv_unix
         python_exe = str(venv_python) if venv_python.exists() else sys.executable
         try:
-            if refresh_execution_mode == "job":
+            if effective_mode == "job":
                 operation_name = _run_cloud_refresh_job()
                 refresh_state["last_status"] = "running"
                 refresh_state["last_operation_name"] = operation_name
@@ -739,6 +747,10 @@ def register_v2_routes(app: Flask) -> None:
             result = subprocess.run(
                 [python_exe, "-u", str(pipeline_path), "--incremental"],
                 capture_output=True, text=True, timeout=refresh_timeout_sec,
+                env={
+                    **os.environ,
+                    "GOOGLE_OAUTH_ACCESS_TOKEN": user_access_token,
+                },
                 cwd=str(base_dir),
             )
             output = result.stdout + result.stderr
@@ -767,6 +779,7 @@ def register_v2_routes(app: Flask) -> None:
                 "status": "ok",
                 "run_id": run_id,
                 "mode": "subprocess",
+                "auth_mode": "user_oauth" if user_access_token else "service_account",
                 "new": new,
                 "updated": updated,
                 "removed": removed,
@@ -781,7 +794,7 @@ def register_v2_routes(app: Flask) -> None:
             refresh_state["last_error"] = str(exc)
             return jsonify({"error": str(exc), "status": _state_snapshot()}), 500
         finally:
-            if refresh_execution_mode != "job" or refresh_state.get("last_status") == "failed":
+            if effective_mode != "job" or refresh_state.get("last_status") == "failed":
                 refresh_state["running"] = False
                 refresh_state["last_finished_at"] = _now_iso()
             if refresh_lock.locked():
@@ -810,7 +823,6 @@ def register_v2_routes(app: Flask) -> None:
             return jsonify({"error": "File must be a .csv"}), 400
 
         try:
-            from pathlib import Path
             import tempfile
 
             tmp = Path(tempfile.mktemp(suffix=".csv"))
@@ -884,6 +896,8 @@ def register_v2_routes(app: Flask) -> None:
         vendor = str(request.form.get("vendor") or "").strip()
         user_prompt = str(request.form.get("prompt") or "").strip()
         payment_milestones_note = str(request.form.get("payment_milestones_note") or "").strip()
+        user_deliver_to = str(request.form.get("deliver_to") or "").strip()
+        user_header_project = str(request.form.get("header_project") or "").strip()
         prior_context = _parse_prior_context(str(request.form.get("prior_context") or ""))
         file = request.files.get("file")
 
@@ -891,6 +905,11 @@ def register_v2_routes(app: Flask) -> None:
             vendor = str(prior_context.get("vendor") or "").strip()
         if not vendor:
             return {"error": "vendor is required"}, 400
+
+        if user_deliver_to:
+            settings["_user_deliver_to"] = user_deliver_to
+        if user_header_project:
+            settings["_user_header_project"] = user_header_project
 
         pdf_bytes: bytes | None = None
         pdf_filename = ""
@@ -988,7 +1007,6 @@ def register_v2_routes(app: Flask) -> None:
         """Generate AI milestone templates for major CAPEX POs."""
         import subprocess
         import sys
-        from pathlib import Path
 
         denied = _require_settings_editor()
         if denied:
@@ -996,7 +1014,9 @@ def register_v2_routes(app: Flask) -> None:
 
         base_dir = Path(__file__).resolve().parent
         pipeline_path = base_dir / "classify_agent.py"
-        venv_python = base_dir / "venv" / "Scripts" / "python.exe"
+        venv_win = base_dir / "venv" / "Scripts" / "python.exe"
+        venv_unix = base_dir / "venv" / "bin" / "python"
+        venv_python = venv_win if venv_win.exists() else venv_unix
         python_exe = str(venv_python) if venv_python.exists() else sys.executable
         try:
             result = subprocess.run(

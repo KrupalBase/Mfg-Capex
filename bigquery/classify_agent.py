@@ -97,7 +97,7 @@ def _format_examples(examples: list[dict]) -> str:
         vendor = ex.get("vendor_name", ex.get("vendor", ""))
         desc = ex.get("item_description", ex.get("description", ""))
         station = ex.get("final_station_id", "")
-        subcat = ex.get("final_subcategory", ex.get("final_subcategory", ""))
+        subcat = ex.get("final_subcategory", "")
         reason = ex.get("reasoning", "")
         lines.append(
             f"- {vendor} | \"{desc}\" -> station={station or 'null'}, "
@@ -499,7 +499,6 @@ def generate_milestones(provider: str = "", dry_run: bool = False) -> dict[str, 
             print(f"    Items: {len(ctx['top_items'])}, Payments: {len(ctx['existing_payments'])}, Vendor history: {bool(ctx['vendor_history'])}")
         return {"generated": 0, "dry_run": True, "would_process": len(contexts)}
 
-    from datetime import date
     ai_settings = _load_milestone_ai_settings()
     system_prompt = _build_milestone_system_prompt(
         today=date.today(),
@@ -509,8 +508,17 @@ def generate_milestones(provider: str = "", dry_run: bool = False) -> dict[str, 
 
     from google import genai
     from google.genai.types import GenerateContentConfig
+    from user_google_auth import get_signed_in_user_credentials
 
-    client = genai.Client(vertexai=True, project="mfg-eng-19197", location="us-central1")
+    user_creds = get_signed_in_user_credentials()
+    client_kwargs: dict[str, Any] = {
+        "vertexai": True,
+        "project": "mfg-eng-19197",
+        "location": "us-central1",
+    }
+    if user_creds is not None:
+        client_kwargs["credentials"] = user_creds
+    client = genai.Client(**client_kwargs)
     print(f"  Using Gemini directly for milestone generation")
 
     all_templates = []

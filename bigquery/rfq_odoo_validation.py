@@ -10,7 +10,6 @@ from __future__ import annotations
 
 from copy import deepcopy
 import difflib
-import os
 import re
 import time
 from typing import Any
@@ -143,16 +142,16 @@ def _cache_set(key: str, value: dict[str, Any]) -> None:
 
 
 def _source_table(name: str) -> str:
-    project = os.environ.get("ODOO_SOURCE_PROJECT", "gtm-analytics-447201")
-    dataset = os.environ.get("ODOO_SOURCE_DATASET", "odoo_public")
-    return f"`{project}.{dataset}.{name}`"
+    import bq_dataset
+    return bq_dataset.source_table(name)
 
 
 def _run_source_query(sql: str) -> list[str]:
+    """Run a SQL query against the Odoo source project via service account."""
     try:
         import bq_dataset
 
-        df = bq_dataset.run_query(sql)
+        df = bq_dataset.run_source_query(sql)
         if df.empty:
             return []
         values = df.iloc[:, 0].astype(str).map(_norm).tolist()
@@ -170,13 +169,25 @@ def _fetch_odoo_public_lookups() -> dict[str, list[str]]:
     )
     vendors = _run_source_query(
         f"""
-        SELECT DISTINCT TRIM(CAST(name AS STRING)) AS value
-        FROM {_source_table("res_partner")}
-        WHERE COALESCE(active, TRUE) = TRUE
-          AND COALESCE(SAFE_CAST(supplier_rank AS INT64), 0) > 0
-          AND name IS NOT NULL
+        SELECT value
+        FROM (
+            SELECT DISTINCT TRIM(CAST(v.name AS STRING)) AS value
+            FROM {_source_table("purchase_order")} po
+            JOIN {_source_table("res_partner")} v ON v.id = po.partner_id
+            WHERE v.name IS NOT NULL
+              AND COALESCE(v.active, TRUE) = TRUE
+
+            UNION DISTINCT
+
+            SELECT DISTINCT TRIM(CAST(name AS STRING)) AS value
+            FROM {_source_table("res_partner")}
+            WHERE COALESCE(active, TRUE) = TRUE
+              AND COALESCE(SAFE_CAST(supplier_rank AS INT64), 0) > 0
+              AND name IS NOT NULL
+        )
+        WHERE value IS NOT NULL
         ORDER BY value
-        LIMIT 5000
+        LIMIT 20000
         """
     )
     projects = _run_source_query(
@@ -285,9 +296,9 @@ def _fetch_bq_lookups(*, force_refresh: bool = False) -> dict[str, list[str]]:
     # Always merge local CAPEX mirror for project relevance / common use coverage.
     _add_values(values, "projects", list(preferred_projects))
 
-    # Fill from local mirror only when upstream Odoo source lookup is unavailable.
-    if not source_values.get("vendors"):
-        _add_values(values, "vendors", odoo_df.get("vendor_name", pd.Series(dtype=str)).astype(str).tolist())
+    # Always merge local mirror vendor values so lookups include recently synced
+    # vendors even when upstream source is delayed/incomplete.
+    _add_values(values, "vendors", odoo_df.get("vendor_name", pd.Series(dtype=str)).astype(str).tolist())
 
     # Product lookup should be strict Odoo-import values; avoid noisy tokenized fallbacks.
     product_candidates = set(source_values.get("products", []))
@@ -431,6 +442,10 @@ def load_lookup_snapshot(
     }
 
 
+def _strip_trailing_punct(s: str) -> str:
+    return re.sub(r"[.,;:!?]+$", "", s).strip()
+
+
 def _canonicalize(
     value: str,
     options: list[str],
@@ -453,6 +468,16 @@ def _canonicalize(
         return exact[0], None, []
     if len(exact) > 1:
         return raw, f"Ambiguous match for '{raw}'.", exact[:10]
+
+    # Retry after stripping trailing punctuation (e.g. "Precitec, Inc." vs "Precitec, Inc").
+    stripped = _strip_trailing_punct(raw)
+    stripped_map: dict[str, list[str]] = {}
+    for opt in options:
+        stripped_map.setdefault(_strip_trailing_punct(opt).lower(), []).append(opt)
+
+    stripped_exact = stripped_map.get(stripped.lower(), [])
+    if len(stripped_exact) == 1:
+        return stripped_exact[0], None, []
 
     contains = [opt for opt in options if raw.lower() in opt.lower()]
     if len(contains) == 1:

@@ -231,12 +231,17 @@ class GeminiAdapter(LLMAdapter):
     ) -> list[ClassificationResult]:
         from google import genai
         from google.genai.types import GenerateContentConfig
+        from user_google_auth import get_signed_in_user_credentials
 
-        client = genai.Client(
-            vertexai=True,
-            project=self._project,
-            location=self._location,
-        )
+        user_creds = get_signed_in_user_credentials()
+        client_kwargs: dict[str, Any] = {
+            "vertexai": True,
+            "project": self._project,
+            "location": self._location,
+        }
+        if user_creds is not None:
+            client_kwargs["credentials"] = user_creds
+        client = genai.Client(**client_kwargs)
         user_msg = self._build_user_prompt(items)
 
         response = client.models.generate_content(

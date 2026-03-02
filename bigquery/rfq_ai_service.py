@@ -177,6 +177,10 @@ def _explicit_reference_copy_requested(user_prompt: str) -> bool:
 
 
 def _load_payment_terms_hint(reference_po: str, vendor: str) -> str:
+    """Load milestone template for the given PO/vendor and format as standardized lines.
+
+    Output format: "Milestone 1: 25% expected date 02/15/2026; Milestone 2: 75% ..."
+    """
     po = _norm(reference_po).upper()
     if not po:
         return ""
@@ -200,16 +204,48 @@ def _load_payment_terms_hint(reference_po: str, vendor: str) -> str:
         if not isinstance(milestones, list):
             return ""
         chunks: list[str] = []
-        for milestone in milestones:
+        for i, milestone in enumerate(milestones, 1):
             if not isinstance(milestone, dict):
                 continue
-            label = _norm(milestone.get("label")) or "Milestone"
+            label = _norm(milestone.get("label")) or f"Milestone {i}"
             pct = _to_float(milestone.get("pct"), 0.0)
             if pct <= 0:
                 continue
-            chunks.append(f"{label} {pct:g}%")
-        return "; ".join(chunks[:4])
+            date_str = _norm(milestone.get("expected_date"))
+            if date_str:
+                try:
+                    from datetime import datetime as _dt
+                    d = _dt.strptime(date_str[:10], "%Y-%m-%d")
+                    date_str = d.strftime("%m/%d/%Y")
+                except Exception:
+                    pass
+            if date_str:
+                chunks.append(f"{label}: {pct:g}% expected date {date_str}")
+            else:
+                chunks.append(f"{label}: {pct:g}%")
+        return "; ".join(chunks[:6])
     return ""
+
+
+def _load_milestone_templates_for_vendor(vendor: str) -> list[dict]:
+    """Find all milestone templates matching a vendor (for auto-populating the payment note)."""
+    try:
+        raw = store.read_json("payment_templates.json")
+    except Exception:
+        return []
+    if not isinstance(raw, list):
+        return []
+    vendor_norm = _norm_match(vendor)
+    if not vendor_norm:
+        return []
+    matches: list[dict] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        row_vendor = _norm(item.get("vendor_name"))
+        if _norm_match(row_vendor) == vendor_norm:
+            matches.append(item)
+    return matches
 
 
 def _load_vendor_context(vendor: str, user_prompt: str, prior: dict[str, Any]) -> dict[str, Any]:
@@ -356,6 +392,7 @@ def _load_vendor_context(vendor: str, user_prompt: str, prior: dict[str, Any]) -
     context["projects"] = projects
     context["terms"] = _norm(terms)
     context["payment_terms_hint"] = _load_payment_terms_hint(template_po, vendor_name)
+    context["milestone_templates"] = _load_milestone_templates_for_vendor(vendor_name)
     context["top_subcategory"] = _norm(top_subcategory)
     context["template_quality_score"] = round(score, 2)
     context["template_quality_notes"] = quality_notes
@@ -482,12 +519,17 @@ def _call_llm_json(
     if selected == "gemini":
         from google import genai
         from google.genai.types import GenerateContentConfig, Part
+        from user_google_auth import get_signed_in_user_credentials
 
-        client = genai.Client(
-            vertexai=True,
-            project=os.environ.get("BQ_ANALYTICS_PROJECT", "mfg-eng-19197"),
-            location=os.environ.get("RFQ_AI_LOCATION", "us-central1"),
-        )
+        user_creds = get_signed_in_user_credentials()
+        client_kwargs: dict[str, Any] = {
+            "vertexai": True,
+            "project": os.environ.get("BQ_ANALYTICS_PROJECT", "mfg-eng-19197"),
+            "location": os.environ.get("RFQ_AI_LOCATION", "us-central1"),
+        }
+        if user_creds is not None:
+            client_kwargs["credentials"] = user_creds
+        client = genai.Client(**client_kwargs)
         model = os.environ.get("RFQ_AI_MODEL", "gemini-2.5-pro")
         contents: Any = user_content
         if pdf_bytes:
@@ -631,7 +673,10 @@ def _vendor_match_errors(
     if not selected:
         return errors
 
-    if _norm(detected_vendor) and _norm(detected_vendor).lower() != selected.lower():
+    def _punct_norm(s: str) -> str:
+        return re.sub(r"[.,;:!?]+$", "", _norm(s)).strip().lower()
+
+    if _norm(detected_vendor) and _punct_norm(detected_vendor) != _punct_norm(selected):
         errors.append(
             {
                 "field": "vendor",
@@ -866,6 +911,34 @@ def _apply_payment_note_line(
         preferred_note = _normalize_payment_note(_extract_payment_milestones_from_text(quote_text))
     if not preferred_note:
         preferred_note = _normalize_payment_note(_norm(vendor_context.get("payment_terms_hint")))
+    if not preferred_note:
+        milestone_templates = vendor_context.get("milestone_templates", [])
+        if isinstance(milestone_templates, list) and milestone_templates:
+            best = milestone_templates[0]
+            milestones = best.get("milestones", [])
+            if isinstance(milestones, list) and milestones:
+                parts: list[str] = []
+                for i, ms in enumerate(milestones, 1):
+                    if not isinstance(ms, dict):
+                        continue
+                    label = _norm(ms.get("label")) or f"Milestone {i}"
+                    pct = _to_float(ms.get("pct"), 0.0)
+                    if pct <= 0:
+                        continue
+                    date_str = _norm(ms.get("expected_date"))
+                    if date_str:
+                        try:
+                            from datetime import datetime as _dt
+                            d = _dt.strptime(date_str[:10], "%Y-%m-%d")
+                            date_str = d.strftime("%m/%d/%Y")
+                        except Exception:
+                            pass
+                    if date_str:
+                        parts.append(f"{label}: {pct:g}% expected date {date_str}")
+                    else:
+                        parts.append(f"{label}: {pct:g}%")
+                if parts:
+                    preferred_note = _normalize_payment_note("; ".join(parts[:6]))
     if not preferred_note:
         return data, warnings
 
@@ -1309,6 +1382,15 @@ def generate_rfq_payload(
         allow_reference_copy=reference_copy_requested,
         has_primary_quote_signal=has_primary_quote_signal,
     )
+    # Apply user-selected header overrides (deliver-to, project) so the AI
+    # output doesn't silently revert the user's pick to the default.
+    user_deliver_to = _norm(cfg.get("_user_deliver_to"))
+    user_header_project = _norm(cfg.get("_user_header_project"))
+    if user_deliver_to:
+        draft.setdefault("header", {})["deliver_to"] = user_deliver_to
+    if user_header_project:
+        draft.setdefault("header", {})["project"] = user_header_project
+
     draft, payment_line_warnings = _apply_payment_note_line(
         draft,
         payment_milestones_note=_norm(payment_milestones_note),

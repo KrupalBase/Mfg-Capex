@@ -9,7 +9,6 @@ Dataset: mfg-eng-19197.capex_analytics
 from __future__ import annotations
 
 import os
-from typing import Any
 
 import pandas as pd
 from google.cloud import bigquery
@@ -18,14 +17,80 @@ ANALYTICS_PROJECT = os.environ.get("BQ_ANALYTICS_PROJECT", "mfg-eng-19197")
 ANALYTICS_DATASET = os.environ.get("BQ_ANALYTICS_DATASET", "capex_analytics")
 FULL_DATASET_ID = f"{ANALYTICS_PROJECT}.{ANALYTICS_DATASET}"
 
-_bq_client: bigquery.Client | None = None
+QUERY_PROJECT = os.environ.get(
+    "BQ_QUERY_PROJECT",
+    os.environ.get("ODOO_SOURCE_PROJECT", "gtm-analytics-447201"),
+)
+ODOO_SOURCE_PROJECT = os.environ.get("ODOO_SOURCE_PROJECT", "gtm-analytics-447201")
+ODOO_SOURCE_DATASET = os.environ.get("ODOO_SOURCE_DATASET", "odoo_public")
+
+_service_bq_client: bigquery.Client | None = None
+_source_bq_client: bigquery.Client | None = None
+
+
+def _get_service_client() -> bigquery.Client:
+    global _service_bq_client
+    if _service_bq_client is None:
+        _service_bq_client = bigquery.Client(project=ANALYTICS_PROJECT)
+    return _service_bq_client
 
 
 def _get_client() -> bigquery.Client:
-    global _bq_client
-    if _bq_client is None:
-        _bq_client = bigquery.Client(project=ANALYTICS_PROJECT)
-    return _bq_client
+    """Return BigQuery client scoped to the analytics project.
+
+    For interactive web requests, prefer the signed-in user's Google credentials
+    (when available). For jobs/scripts, fall back to service account credentials.
+    """
+    try:
+        from user_google_auth import get_signed_in_user_credentials
+
+        user_creds = get_signed_in_user_credentials()
+        if user_creds is not None:
+            return bigquery.Client(project=ANALYTICS_PROJECT, credentials=user_creds)
+    except Exception:
+        pass
+    return _get_service_client()
+
+
+def _get_source_service_client() -> bigquery.Client:
+    """Return a service-account BigQuery client for Odoo source queries."""
+    global _source_bq_client
+    if _source_bq_client is None:
+        _source_bq_client = bigquery.Client(project=QUERY_PROJECT)
+    return _source_bq_client
+
+
+def get_source_client(*, oauth_token: str | None = None) -> bigquery.Client:
+    """Return a BigQuery client for querying the Odoo source project.
+
+    When *oauth_token* is provided (e.g. from a signed-in dashboard user),
+    a short-lived user-credential client is returned. Otherwise the cached
+    service-account client is used.
+    """
+    token = (oauth_token or "").strip()
+    if token:
+        try:
+            from google.oauth2.credentials import Credentials
+
+            creds = Credentials(
+                token=token,
+                scopes=["https://www.googleapis.com/auth/cloud-platform"],
+            )
+            return bigquery.Client(project=QUERY_PROJECT, credentials=creds)
+        except Exception:
+            pass
+    return _get_source_service_client()
+
+
+def source_table(name: str) -> str:
+    """Return a fully-qualified backtick-quoted BigQuery table reference."""
+    return f"`{ODOO_SOURCE_PROJECT}.{ODOO_SOURCE_DATASET}.{name}`"
+
+
+def run_source_query(sql: str) -> pd.DataFrame:
+    """Execute SQL against the Odoo source project using service-account credentials."""
+    client = _get_source_service_client()
+    return client.query(sql).to_dataframe()
 
 
 # ---------------------------------------------------------------------------
@@ -122,12 +187,18 @@ _OVERRIDES_SCHEMA = [
 _CLASSIFICATION_REVIEWS_SCHEMA = [
     bigquery.SchemaField("review_id", "STRING", mode="REQUIRED"),
     bigquery.SchemaField("line_id", "STRING"),
+    bigquery.SchemaField("po_number", "STRING"),
     bigquery.SchemaField("vendor_name", "STRING"),
     bigquery.SchemaField("item_description", "STRING"),
     bigquery.SchemaField("price_subtotal", "FLOAT64"),
+    bigquery.SchemaField("project_name", "STRING"),
+    bigquery.SchemaField("product_category", "STRING"),
+    bigquery.SchemaField("source", "STRING"),
+    bigquery.SchemaField("date_order", "STRING"),
     bigquery.SchemaField("rule_station", "STRING"),
     bigquery.SchemaField("rule_subcat", "STRING"),
     bigquery.SchemaField("rule_confidence", "FLOAT64"),
+    bigquery.SchemaField("rule_mapping_status", "STRING"),
     bigquery.SchemaField("llm_station", "STRING"),
     bigquery.SchemaField("llm_subcat", "STRING"),
     bigquery.SchemaField("llm_confidence", "FLOAT64"),

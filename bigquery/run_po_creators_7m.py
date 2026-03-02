@@ -6,21 +6,14 @@ po_updated_date, po_created_date.
 """
 from __future__ import annotations
 
-import os
 import pathlib
 
-from google.cloud import bigquery
+import bq_dataset
 
 import storage_backend as store
 from capex_pipeline import DEFAULT_CREATOR_NAMES
 from po_export_utils import clean_po_dataframe
 
-
-DEFAULT_ODOO_SOURCE_PROJECT = "gtm-analytics-447201"
-DEFAULT_ODOO_SOURCE_DATASET = "odoo_public"
-ODOO_SOURCE_PROJECT = os.environ.get("ODOO_SOURCE_PROJECT", DEFAULT_ODOO_SOURCE_PROJECT)
-ODOO_SOURCE_DATASET = os.environ.get("ODOO_SOURCE_DATASET", DEFAULT_ODOO_SOURCE_DATASET)
-QUERY_PROJECT = os.environ.get("BQ_QUERY_PROJECT", ODOO_SOURCE_PROJECT)
 SQL_FILE = pathlib.Path(__file__).resolve().parent / "po_by_creators_last_7m.sql"
 OUT_CSV = pathlib.Path(__file__).resolve().parent / "po_creators_last_7m.csv"
 
@@ -55,16 +48,17 @@ def main() -> None:
     creator_names = _load_creator_names()
     creator_sql = _format_creator_names_sql(creator_names)
 
-    client = bigquery.Client(project=QUERY_PROJECT)
+    odoo_ref = f"{bq_dataset.ODOO_SOURCE_PROJECT}.{bq_dataset.ODOO_SOURCE_DATASET}"
+    client = bq_dataset.get_source_client()
     query_text = SQL_FILE.read_text(encoding="utf-8")
     query_text = "\n".join(
         line for line in query_text.splitlines()
         if not line.strip().startswith("--")
     ).strip().rstrip(";")
-    query_text = query_text.replace("{odoo_source}", f"{ODOO_SOURCE_PROJECT}.{ODOO_SOURCE_DATASET}")
+    query_text = query_text.replace("{odoo_source}", odoo_ref)
     query_text = query_text.replace("{creator_names}", creator_sql)
 
-    print(f"Running POs by creators on {ODOO_SOURCE_PROJECT}.{ODOO_SOURCE_DATASET}...")
+    print(f"Running POs by creators on {odoo_ref}...")
     print(f"Creator filter size: {len(creator_names)}")
     df = client.query(query_text).to_dataframe()
     print(f"Rows: {len(df)}")

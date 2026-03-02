@@ -5,32 +5,25 @@ Exports cleaned/formatted CSV (project names, dates, numbers, no HTML in notes).
 """
 from __future__ import annotations
 
-import os
 import pathlib
 
-from google.cloud import bigquery
-
+import bq_dataset
 from po_export_utils import clean_po_dataframe
 
-
-DEFAULT_ODOO_SOURCE_PROJECT = "gtm-analytics-447201"
-DEFAULT_ODOO_SOURCE_DATASET = "odoo_public"
-ODOO_SOURCE_PROJECT = os.environ.get("ODOO_SOURCE_PROJECT", DEFAULT_ODOO_SOURCE_PROJECT)
-ODOO_SOURCE_DATASET = os.environ.get("ODOO_SOURCE_DATASET", DEFAULT_ODOO_SOURCE_DATASET)
-QUERY_PROJECT = os.environ.get("BQ_QUERY_PROJECT", ODOO_SOURCE_PROJECT)
 SQL_FILE = pathlib.Path(__file__).resolve().parent / "po_by_krupal_patel.sql"
 
 
 def main() -> None:
-    client = bigquery.Client(project=QUERY_PROJECT)
+    odoo_ref = f"{bq_dataset.ODOO_SOURCE_PROJECT}.{bq_dataset.ODOO_SOURCE_DATASET}"
+    client = bq_dataset.get_source_client()
     query_text = SQL_FILE.read_text(encoding="utf-8")
     query_text = "\n".join(
         line for line in query_text.splitlines()
         if not line.strip().startswith("--")
     ).strip().rstrip(";")
-    query_text = query_text.replace("{odoo_source}", f"{ODOO_SOURCE_PROJECT}.{ODOO_SOURCE_DATASET}")
+    query_text = query_text.replace("{odoo_source}", odoo_ref)
 
-    print(f"Running PO-by-Krupal-Patel query on {ODOO_SOURCE_PROJECT}.{ODOO_SOURCE_DATASET}...")
+    print(f"Running PO-by-Krupal-Patel query on {odoo_ref}...")
     df = client.query(query_text).to_dataframe()
     print(f"Rows: {len(df)}")
     if df.empty:

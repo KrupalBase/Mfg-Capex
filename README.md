@@ -182,6 +182,12 @@ Deploy scripts now support:
 | `REFRESH_JOB_PROJECT` | Project that owns the refresh job |
 | `REFRESH_JOB_REGION` | Region that hosts the refresh job |
 | `REFRESH_TIMEOUT_SEC` | Timeout for refresh execution (`subprocess` mode and job runner) |
+| `REFRESH_USE_LOGGED_IN_OAUTH` | When `true`, on-demand refresh injects signed-in user OAuth token for Odoo/source pulls |
+| `USE_SIGNED_IN_USER_GCP` | When `false` (recommended), Gemini/LLM and non-refresh GCP calls use service account creds |
+| `PREFER_BIGQUERY_MAPPED_CSV` | When `true`, reads for `capex_clean.csv`/`capex_by_station.csv`/`spares_catalog.csv` are served from BigQuery first |
+| `ALLOW_MAPPED_CSV_FALLBACK` | Allow fallback to CSV/GCS for mapped datasets if BigQuery read fails (`false` recommended in cloud) |
+| `WRITE_MAPPED_CSV_TO_BIGQUERY` | When `true`, writes to mapped CSV aliases are mirrored to BigQuery tables |
+| `WRITE_MAPPED_CSV_TO_BIGQUERY_STRICT` | When `true`, mapped CSV writes fail if BigQuery mirror write fails |
 | `GOOGLE_CLIENT_ID` | OAuth 2.0 client ID (set via Secret Manager preferred) |
 | `GOOGLE_CLIENT_SECRET` | OAuth 2.0 client secret (set via Secret Manager preferred) |
 | `FLASK_SECRET_KEY` | Flask session signing key (set via Secret Manager preferred) |
@@ -200,6 +206,12 @@ The deploy scripts accept configuration through environment variables:
 | `SERVICE_ACCOUNT` | `capex-dashboard-sa@<PROJECT>.iam.gserviceaccount.com` |
 | `REFRESH_JOB_NAME` | `capex-refresh-job` |
 | `REFRESH_EXECUTION_MODE` | auto: `job` when job is deployed, else `subprocess` |
+| `REFRESH_USE_LOGGED_IN_OAUTH` | `true` |
+| `USE_SIGNED_IN_USER_GCP` | `false` |
+| `PREFER_BIGQUERY_MAPPED_CSV` | `true` |
+| `ALLOW_MAPPED_CSV_FALLBACK` | `false` |
+| `WRITE_MAPPED_CSV_TO_BIGQUERY` | `true` |
+| `WRITE_MAPPED_CSV_TO_BIGQUERY_STRICT` | `true` |
 | `USE_SECRET_MANAGER` | `true` |
 | `GOOGLE_CLIENT_ID_SECRET` | `capex-google-client-id` |
 | `GOOGLE_CLIENT_SECRET_SECRET` | `capex-google-client-secret` |
