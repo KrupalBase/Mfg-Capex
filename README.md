@@ -82,19 +82,62 @@ flowchart LR
 
 ```
 bigquery/
-├── capex_dashboard.py        # Flask dashboard app (Plotly charts, DataTables)
+│
+│  # ── Apps ──────────────────────────────────────────────────
+├── capex_dashboard.py        # Flask dashboard (Plotly charts, DataTables)
 ├── station_review_app.py     # Flask review UI for station mapping corrections
+├── capex_v2_pages.py         # V2 API routes (classification, payments, cashflow, RFQ)
+│
+│  # ── Pipeline ──────────────────────────────────────────────
 ├── capex_pipeline.py         # End-to-end data pipeline (single entry point)
-├── po_export_utils.py        # Shared data cleaning, mapping, extraction logic
-├── storage_backend.py        # Abstraction layer: local filesystem or GCS
+├── po_export_utils.py        # Shared cleaning, mapping, extraction logic
+├── mfg_subcategory.py        # Manufacturing subcategory classification rules
+│
+│  # ── AI / LLM ──────────────────────────────────────────────
+├── classify_agent.py         # LLM classification review agent (weekly / on-demand)
+├── llm_adapter.py            # Provider-agnostic LLM interface (Gemini, OpenAI, etc.)
+├── rfq_ai_service.py         # AI RFQ generation from vendor quotes
+├── rfq_odoo_validation.py    # RFQ lookup + validation for Odoo import
+├── prompts/
+│   ├── classification_system.txt
+│   ├── classification_examples.json
+│   ├── rfq_system.txt
+│   └── rfq_examples.json
+│
+│  # ── Data / Analytics ──────────────────────────────────────
+├── bq_dataset.py             # BigQuery dataset + table management (capex_analytics)
+├── cashflow.py               # Cashflow projection helpers
+├── payment_patterns.py       # Payment pattern analysis
+├── sheets_forecast_import.py # Google Sheets forecast import
+│
+│  # ── Infrastructure ────────────────────────────────────────
+├── storage_backend.py        # Storage abstraction: local FS / GCS / BigQuery
 ├── auth.py                   # Google OAuth 2.0 (basepowercompany.com only)
-├── Dockerfile                # Unified image for both apps (APP_MODE env var)
-├── deploy.ps1 / deploy.sh    # Cloud Run deployment scripts
-├── requirements.txt          # Python dependencies
-├── run_po_creators_7m.py     # BigQuery query runner (all PO creators)
-├── run_po_by_number.py       # BigQuery query runner (single PO lookup)
+├── user_google_auth.py       # Signed-in user OAuth credential helpers
+├── access_control.py         # Role-based access (owner / editor / viewer)
+├── odoo_client.py            # Odoo XML-RPC client
+├── push_clean_to_cloud.py    # Push local data to GCS
+├── refresh_job_runner.py     # Cloud Run Job entry point for scheduled refresh
+│
+│  # ── SQL Queries ───────────────────────────────────────────
 ├── po_by_creators_last_7m.sql
 ├── po_by_number.sql
+├── po_by_krupal_patel.sql
+├── payment_details.sql
+├── ramp_from_odoo.sql
+│
+│  # ── CLI Query Runners ─────────────────────────────────────
+├── run_po_creators_7m.py     # BigQuery runner: all PO creators (last 7 months)
+├── run_po_by_number.py       # BigQuery runner: single PO lookup
+├── run_po_krupal_query.py    # BigQuery runner: POs by Krupal Patel
+├── run_odoo_query.py         # BigQuery runner: generic Odoo account query
+│
+│  # ── Deploy / Config ───────────────────────────────────────
+├── Dockerfile                # Unified image for both apps (APP_MODE env var)
+├── deploy.ps1 / deploy.sh    # Cloud Run deployment scripts
+├── setup_scheduler_alerts.ps1 # Cloud Scheduler + Monitoring alert setup
+├── requirements.txt          # Python dependencies
+│
 └── data/                     # Local pipeline output (gitignored)
     ├── capex_clean.csv
     ├── capex_by_station.csv
