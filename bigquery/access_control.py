@@ -109,17 +109,22 @@ def user_can_access(user_email: str, settings: dict[str, Any] | None = None) -> 
     Return True if the user is allowed to access the dashboard.
     When restrict_access_to_editors_only is True, only owner and editors can access.
     When False (default), any @company-domain user can access (viewer or higher).
+    Recovery: SETTINGS_OWNER_EMAIL env var always allows that user (for lockout recovery).
     """
     if not _auth_enabled():
         return True
     if settings is None:
         settings, _ = load_settings_with_access_defaults(bootstrap_user_email=user_email)
-    restrict = bool(settings.get(RESTRICT_KEY, False))
-    if not restrict:
-        return True
     user = normalize_email(user_email)
     if not user or not is_company_email(user):
         return False
+    # Recovery: env owner is always allowed (prevents lockout)
+    env_owner = normalize_email(os.environ.get("SETTINGS_OWNER_EMAIL", ""))
+    if env_owner and user == env_owner:
+        return True
+    restrict = bool(settings.get(RESTRICT_KEY, False))
+    if not restrict:
+        return True
     return user in _allowed_users_set(settings)
 
 

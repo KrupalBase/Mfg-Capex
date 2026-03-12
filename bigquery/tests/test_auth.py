@@ -70,9 +70,9 @@ class TestAuthAccessDeniedRoute:
             )
             rv = client.get("/auth/access-denied")
         assert rv.status_code == 200
-        assert b"Access restricted" in rv.data or b"access restricted" in rv.data.lower()
-        assert b"blocked@basepowercompany.com" in rv.data
         assert b"Request access" in rv.data or b"request access" in rv.data.lower()
+        assert b"blocked@basepowercompany.com" in rv.data
+        assert b"Email owner" in rv.data or b"email owner" in rv.data.lower()
         assert b"mailto:" in rv.data
 
     def test_access_denied_mailto_has_owner(self, client):
@@ -88,7 +88,7 @@ class TestAuthAccessDeniedRoute:
                 },
                 False,
             )
-            with patch("access_control.get_access_context") as mock_ctx:
+            with patch("auth.get_access_context") as mock_ctx:
                 mock_ctx.return_value = {"owner_email": "owner@basepowercompany.com"}
                 rv = client.get("/auth/access-denied")
         assert rv.status_code == 200

@@ -2,7 +2,8 @@ param(
     [switch]$Seed,
     [switch]$V2,
     [switch]$NoJob,
-    [switch]$NoSecrets
+    [switch]$NoSecrets,
+    [string]$OwnerEmail  # Your email for lockout recovery + access request notifications. E.g. -OwnerEmail "you@basepowercompany.com"
 )
 
 $PROJECT = if ($env:PROJECT) { $env:PROJECT } else { "mfg-eng-19197" }
@@ -39,6 +40,10 @@ if (-not $REFRESH_EXECUTION_MODE) {
 }
 
 $ENV_COMMON = "GCS_BUCKET=$BUCKET,BQ_ANALYTICS_PROJECT=$BQ_ANALYTICS_PROJECT,BQ_ANALYTICS_DATASET=$BQ_ANALYTICS_DATASET,BQ_QUERY_PROJECT=$BQ_QUERY_PROJECT,ODOO_SOURCE_PROJECT=$ODOO_SOURCE_PROJECT,ODOO_SOURCE_DATASET=$ODOO_SOURCE_DATASET,USE_SIGNED_IN_USER_GCP=false,REFRESH_USE_LOGGED_IN_OAUTH=true,PREFER_BIGQUERY_MAPPED_CSV=true,ALLOW_MAPPED_CSV_FALLBACK=false,WRITE_MAPPED_CSV_TO_BIGQUERY=true,WRITE_MAPPED_CSV_TO_BIGQUERY_STRICT=true,REFRESH_TIMEOUT_SEC=1800,REFRESH_EXECUTION_MODE=$REFRESH_EXECUTION_MODE,REFRESH_JOB_NAME=$REFRESH_JOB_NAME,REFRESH_JOB_REGION=$REGION,REFRESH_JOB_PROJECT=$PROJECT"
+$SETTINGS_OWNER = if ($OwnerEmail) { $OwnerEmail } else { $env:SETTINGS_OWNER_EMAIL }
+if ($SETTINGS_OWNER) {
+    $ENV_COMMON += ",SETTINGS_OWNER_EMAIL=$SETTINGS_OWNER"
+}
 $SECRET_SPEC = "GOOGLE_CLIENT_ID=$($GOOGLE_CLIENT_ID_SECRET):latest,GOOGLE_CLIENT_SECRET=$($GOOGLE_CLIENT_SECRET_SECRET):latest,FLASK_SECRET_KEY=$($FLASK_SECRET_KEY_SECRET):latest"
 
 if (-not $USE_SECRET_MANAGER) {
@@ -222,4 +227,8 @@ if ($DEPLOY_JOB) {
 }
 Write-Host "Auth posture: Cloud Run private + in-app Google OAuth."
 Write-Host "Use setup_iap.ps1 if you also want IAP at the edge."
+if ($SETTINGS_OWNER) {
+    Write-Host "Lockout recovery: SETTINGS_OWNER_EMAIL=$SETTINGS_OWNER (always allowed)"
+}
+Write-Host "Access requests: Add SMTP_USER + SMTP_PASSWORD env (or secrets) to Cloud Run for email notifications."
 Write-Host "================================================================"

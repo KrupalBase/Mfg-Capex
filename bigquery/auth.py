@@ -8,18 +8,55 @@ from __future__ import annotations
 
 import os
 import secrets
+import smtplib
 import time
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from urllib.parse import urlencode, quote
 
 import requests as http_requests
-from flask import Flask, redirect, request, session, render_template_string
+from flask import Flask, jsonify, redirect, request, session, render_template_string
 from werkzeug.middleware.proxy_fix import ProxyFix
 
-from access_control import load_settings_with_access_defaults, user_can_access
+from access_control import get_access_context, load_settings_with_access_defaults, user_can_access
 
 
 def _url_quote(s: str) -> str:
     return quote(s, safe="")
+
+
+def _send_access_request_email(to_email: str, requester_email: str, requester_name: str = "") -> bool:
+    """Send access request email to owner. Returns True if sent, False if SMTP not configured."""
+    smtp_user = os.environ.get("SMTP_USER", "").strip()
+    smtp_password = os.environ.get("SMTP_PASSWORD", "").strip()
+    if not smtp_user or not smtp_password:
+        return False
+    smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com").strip()
+    smtp_port = int(os.environ.get("SMTP_PORT", "587") or "587")
+    from_addr = os.environ.get("SMTP_FROM", smtp_user).strip()
+
+    subject = "CAPEX Dashboard: Access request from " + requester_email
+    body = (
+        f"A user has requested access to the Base Power CAPEX Dashboard.\n\n"
+        f"Requester email: {requester_email}\n"
+        f"Requester name: {requester_name or '(not provided)'}\n\n"
+        f"To grant access, add this email to Settings > Access Control > Settings Editors in the dashboard.\n\n"
+        f"---\nThis is an automated message from the CAPEX Dashboard."
+    )
+    msg = MIMEMultipart()
+    msg["From"] = from_addr
+    msg["To"] = to_email
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain"))
+
+    try:
+        with smtplib.SMTP(smtp_host, smtp_port) as server:
+            server.starttls()
+            server.login(smtp_user, smtp_password)
+            server.sendmail(from_addr, [to_email], msg.as_string())
+        return True
+    except Exception:
+        return False
 
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
@@ -112,7 +149,7 @@ ACCESS_DENIED_HTML = """
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Access Denied - Base Power</title>
+<title>Request Access - Base Power</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:#1A1A1A;color:#F0EEEB;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:24px}
@@ -129,7 +166,13 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:#1A1A1
 .denied-card .user{font-size:12px;color:#B2DD79;margin-bottom:20px;word-break:break-all}
 .btn-request{display:inline-flex;align-items:center;justify-content:center;gap:8px;background:#B2DD79;color:#1A1A1A;border:none;border-radius:10px;padding:12px 20px;font-size:14px;font-weight:600;cursor:pointer;text-decoration:none;transition:all .2s}
 .btn-request:hover{background:#c5e89a;box-shadow:0 4px 16px rgba(178,221,121,.25)}
-.btn-logout{display:inline-block;margin-top:16px;font-size:12px;color:#9E9C98;text-decoration:none}
+.btn-request:disabled{opacity:.6;cursor:not-allowed}
+.btn-mailto{display:inline-flex;align-items:center;justify-content:center;gap:8px;background:#048EE5;color:#fff;border:none;border-radius:10px;padding:12px 20px;font-size:14px;font-weight:600;cursor:pointer;text-decoration:none;transition:all .2s}
+.btn-mailto:hover{background:#1a9ff5;box-shadow:0 4px 16px rgba(4,142,229,.25)}
+.msg{font-size:13px;margin-top:16px;padding:10px 14px;border-radius:8px}
+.msg.success{background:rgba(178,221,121,.15);color:#B2DD79;border:1px solid rgba(178,221,121,.3)}
+.msg.error{background:rgba(209,83,29,.12);color:#D1531D;border:1px solid rgba(209,83,29,.3)}
+.btn-logout{display:inline-block;margin-top:20px;font-size:12px;color:#9E9C98;text-decoration:none}
 .btn-logout:hover{color:#F0EEEB;text-decoration:underline}
 </style>
 </head>
@@ -143,13 +186,42 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:#1A1A1
         <h1>Base Power</h1>
     </div>
     <div class="denied-card">
-        <div class="title">Access restricted</div>
-        <div class="subtitle">This dashboard is limited to specific users. You're signed in but don't have access yet.</div>
+        <div class="title">Request access</div>
+        <div class="subtitle">This dashboard is limited to specific users. You're signed in but don't have access yet. Send a request and the owner will be notified by email.</div>
         {% if user_email %}<div class="user">Signed in as {{ user_email }}</div>{% endif %}
-        <a href="{{ request_access_url }}" class="btn-request">Request access</a>
+        {% if owner_email %}<div class="user" style="color:#9E9C98;font-size:11px">Owner: {{ owner_email }}</div>{% endif %}
+        <div id="request-area">
+            {% if email_configured %}
+            <button type="button" class="btn-request" id="btn-request" onclick="sendRequest()">Send request to owner</button>
+            {% else %}
+            <a href="{{ request_access_url }}" class="btn-mailto" id="btn-mailto">Email owner to request access</a>
+            {% endif %}
+        </div>
+        <div id="request-msg" class="msg" style="display:none"></div>
         <a href="/auth/logout" class="btn-logout">Sign out</a>
     </div>
 </div>
+<script>
+async function sendRequest(){
+    const btn=document.getElementById('btn-request');
+    const msg=document.getElementById('request-msg');
+    btn.disabled=true;
+    msg.style.display='none';
+    try{
+        const r=await fetch('/auth/request-access',{method:'POST',headers:{'Content-Type':'application/json'}});
+        const d=await r.json();
+        msg.style.display='block';
+        msg.className='msg '+(d.ok?'success':'error');
+        msg.textContent=d.ok?d.message:(d.error||'Request failed');
+        if(!d.ok&&d.mailto){msg.innerHTML+=' <a href="'+d.mailto+'" class="btn-mailto" style="display:inline-block;margin-top:8px;padding:8px 14px;font-size:12px">Email owner</a>';}
+    }catch(e){
+        msg.style.display='block';
+        msg.className='msg error';
+        msg.textContent='Request failed. Try the email link below.';
+    }
+    btn.disabled=false;
+}
+</script>
 </body>
 </html>
 """
@@ -335,7 +407,6 @@ def init_auth(app: Flask) -> None:
     @app.route("/auth/access-denied")
     def auth_access_denied():
         """Show access denied page with option to request access from owner."""
-        from access_control import get_access_context, load_settings_with_access_defaults
         user_email = str(session.get("user_email", "") or "")
         settings, _ = load_settings_with_access_defaults(bootstrap_user_email=user_email)
         ctx = get_access_context(settings, user_email=user_email)
@@ -352,11 +423,34 @@ def init_auth(app: Flask) -> None:
             if owner
             else "#"
         )
+        email_configured = bool(os.environ.get("SMTP_USER", "").strip() and os.environ.get("SMTP_PASSWORD", "").strip())
         return render_template_string(
             ACCESS_DENIED_HTML,
             user_email=user_email or None,
+            owner_email=owner or None,
             request_access_url=request_access_url,
+            email_configured=email_configured,
         )
+
+    @app.route("/auth/request-access", methods=["POST"])
+    def auth_request_access():
+        """Send access request email to owner. Requires session."""
+        user_email = str(session.get("user_email", "") or "").strip().lower()
+        if not user_email:
+            return jsonify({"ok": False, "error": "Not signed in"}), 401
+        settings, _ = load_settings_with_access_defaults(bootstrap_user_email=user_email)
+        ctx = get_access_context(settings, user_email=user_email)
+        owner = ctx.get("owner_email", "").strip()
+        if not owner:
+            return jsonify({"ok": False, "error": "No owner configured. Contact your administrator."}), 400
+        user_name = str(session.get("user_name", "") or "").strip()
+        if _send_access_request_email(owner, user_email, user_name):
+            return jsonify({"ok": True, "message": "Request sent! The owner will receive an email."})
+        return jsonify({
+            "ok": False,
+            "error": "Email not configured. Use the link below to email the owner directly.",
+            "mailto": f"mailto:{owner}?subject={_url_quote('Request access to CAPEX Dashboard')}&body={_url_quote(f'My email: {user_email}\n\nPlease add me to the allowed users.')}",
+        }), 503
 
     @app.route("/auth/logout")
     def auth_logout():
