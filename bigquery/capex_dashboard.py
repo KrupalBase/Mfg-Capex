@@ -19,6 +19,7 @@ from access_control import (
     current_user_email,
     EDITORS_KEY,
     OWNER_KEY,
+    RESTRICT_KEY,
     ensure_access_defaults,
     get_access_context,
     is_company_email,
@@ -1539,6 +1540,13 @@ table.dataTable tbody td{font-size:11px!important;padding:6px 4px!important}
                 <label style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px">Settings Editors (one email per line)</label>
                 <textarea id="settings-editor-emails" style="width:100%;height:120px;background:var(--surface2);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:12px;font-family:monospace;font-size:12px;resize:vertical;line-height:1.5" placeholder="editor1@basepowercompany.com&#10;editor2@basepowercompany.com"></textarea>
                 <div style="font-size:11px;color:var(--muted);margin-top:6px">Editors can modify major settings and run data refresh/upload operations. Owner can also manage this access list.</div>
+            </div>
+            <div style="display:flex;align-items:flex-start;gap:12px;margin-top:8px">
+                <input type="checkbox" id="settings-restrict-access" style="margin-top:4px;accent-color:var(--green)"/>
+                <div>
+                    <label for="settings-restrict-access" style="font-size:13px;font-weight:600;cursor:pointer">Restrict access to owners and editors only</label>
+                    <div style="font-size:11px;color:var(--muted);margin-top:4px">When enabled, only the owner and editors above can access the dashboard. Others will see an &quot;Access denied&quot; page with an option to request access.</div>
+                </div>
             </div>
         </div>
     </div>
@@ -4467,7 +4475,7 @@ function applySettingsAccessUi(){
 
     document.querySelectorAll('#page-settings textarea, #page-settings input, #page-settings select').forEach(el=>{
         const id=el.id||'';
-        if(id==='settings-owner-email'||id==='settings-editor-emails'){
+        if(id==='settings-owner-email'||id==='settings-editor-emails'||id==='settings-restrict-access'){
             el.disabled=!canManage;
         }else{
             el.disabled=!canEdit;
@@ -4510,6 +4518,8 @@ async function loadSettings(){
     document.getElementById('settings-rfq-system-prompt').value=savedSettings.rfq_ai_system_prompt||'';
     document.getElementById('settings-owner-email').value=savedSettings.settings_owner_email||'';
     document.getElementById('settings-editor-emails').value=(savedSettings.settings_editor_emails||[]).join('\n');
+    const restrictEl=document.getElementById('settings-restrict-access');
+    if(restrictEl)restrictEl.checked=!!savedSettings.restrict_access_to_editors_only;
     document.getElementById('settings-refresh-cron').value=savedSettings.ops_refresh_cron||'0 8 * * *';
     document.getElementById('settings-refresh-timezone').value=savedSettings.ops_refresh_timezone||'Etc/UTC';
     document.getElementById('settings-alert-emails').value=(savedSettings.ops_alert_emails||[]).join('\n');
@@ -4571,6 +4581,8 @@ async function saveSettings(){
             .split('\n')
             .map(v=>v.trim().toLowerCase())
             .filter(v=>v.length>0);
+        const restrictEl=document.getElementById('settings-restrict-access');
+        body.restrict_access_to_editors_only=!!(restrictEl&&restrictEl.checked);
     }
     const res=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     const d=await res.json();
@@ -5246,7 +5258,7 @@ def api_settings_save():
     if not access.get("can_edit_settings"):
         return jsonify({"ok": False, "error": "Settings edit access required", "access": access}), 403
 
-    touches_access = (OWNER_KEY in body) or (EDITORS_KEY in body)
+    touches_access = (OWNER_KEY in body) or (EDITORS_KEY in body) or (RESTRICT_KEY in body)
     if touches_access and not access.get("can_manage_access"):
         return jsonify({
             "ok": False,
@@ -5267,6 +5279,9 @@ def api_settings_save():
         if settings.get(OWNER_KEY) and settings[OWNER_KEY] not in settings[EDITORS_KEY]:
             settings[EDITORS_KEY].insert(0, settings[OWNER_KEY])
 
+    if access.get("can_manage_access") and RESTRICT_KEY in body:
+        settings[RESTRICT_KEY] = bool(body.get(RESTRICT_KEY, False))
+
     if "ops_alert_emails" in body:
         settings["ops_alert_emails"] = normalize_email_list(body.get("ops_alert_emails", []))
     if "ops_refresh_cron" in body:
@@ -5277,7 +5292,7 @@ def api_settings_save():
         settings["ops_refresh_timezone"] = tz if tz else "Etc/UTC"
 
     for key, value in body.items():
-        if key in {OWNER_KEY, EDITORS_KEY, "ops_alert_emails", "ops_refresh_cron", "ops_refresh_timezone"}:
+        if key in {OWNER_KEY, EDITORS_KEY, RESTRICT_KEY, "ops_alert_emails", "ops_refresh_cron", "ops_refresh_timezone"}:
             continue
         settings[key] = value
 

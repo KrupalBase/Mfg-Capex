@@ -17,6 +17,7 @@ import storage_backend as store
 
 OWNER_KEY = "settings_owner_email"
 EDITORS_KEY = "settings_editor_emails"
+RESTRICT_KEY = "restrict_access_to_editors_only"
 DEFAULT_DOMAIN = "basepowercompany.com"
 
 
@@ -93,6 +94,35 @@ def load_settings_with_access_defaults(*, bootstrap_user_email: str = "") -> tup
     return ensure_access_defaults(settings, bootstrap_user_email=bootstrap_user_email)
 
 
+def _allowed_users_set(settings: dict[str, Any]) -> set[str]:
+    """Return the set of emails allowed to access when restrict_access_to_editors_only is True."""
+    owner = normalize_email(settings.get(OWNER_KEY))
+    editors = normalize_email_list(settings.get(EDITORS_KEY, []))
+    allowed = set(editors)
+    if owner:
+        allowed.add(owner)
+    return allowed
+
+
+def user_can_access(user_email: str, settings: dict[str, Any] | None = None) -> bool:
+    """
+    Return True if the user is allowed to access the dashboard.
+    When restrict_access_to_editors_only is True, only owner and editors can access.
+    When False (default), any @company-domain user can access (viewer or higher).
+    """
+    if not _auth_enabled():
+        return True
+    if settings is None:
+        settings, _ = load_settings_with_access_defaults(bootstrap_user_email=user_email)
+    restrict = bool(settings.get(RESTRICT_KEY, False))
+    if not restrict:
+        return True
+    user = normalize_email(user_email)
+    if not user or not is_company_email(user):
+        return False
+    return user in _allowed_users_set(settings)
+
+
 def get_access_context(settings: dict[str, Any] | None = None, *, user_email: str = "") -> dict[str, Any]:
     user = normalize_email(user_email) or current_user_email()
 
@@ -122,6 +152,14 @@ def get_access_context(settings: dict[str, Any] | None = None, *, user_email: st
         can_edit_settings = False
         can_manage_access = False
 
+    restrict = bool(settings.get(RESTRICT_KEY, False))
+    access_denied = (
+        _auth_enabled()
+        and restrict
+        and user
+        and user not in _allowed_users_set(settings)
+    )
+
     return {
         "auth_enabled": _auth_enabled(),
         "role": role,
@@ -130,4 +168,6 @@ def get_access_context(settings: dict[str, Any] | None = None, *, user_email: st
         "editor_emails": sorted(editors_set),
         "can_edit_settings": can_edit_settings,
         "can_manage_access": can_manage_access,
+        "restrict_access_to_editors_only": restrict,
+        "access_denied": access_denied,
     }

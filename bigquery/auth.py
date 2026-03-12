@@ -9,11 +9,17 @@ from __future__ import annotations
 import os
 import secrets
 import time
-from urllib.parse import urlencode
+from urllib.parse import urlencode, quote
 
 import requests as http_requests
 from flask import Flask, redirect, request, session, render_template_string
 from werkzeug.middleware.proxy_fix import ProxyFix
+
+from access_control import load_settings_with_access_defaults, user_can_access
+
+
+def _url_quote(s: str) -> str:
+    return quote(s, safe="")
 
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
@@ -100,6 +106,54 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:#1A1A1
 </html>
 """
 
+ACCESS_DENIED_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Access Denied - Base Power</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:#1A1A1A;color:#F0EEEB;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:24px}
+.denied-bg{position:fixed;inset:0;z-index:0;overflow:hidden;pointer-events:none}
+.denied-bg .glow{position:absolute;border-radius:50%;filter:blur(120px);opacity:.12}
+.denied-bg .glow.g1{width:320px;height:320px;background:#D1531D;top:-60px;left:-40px}
+.denied-wrap{position:relative;z-index:1;width:100%;max-width:420px}
+.denied-brand{text-align:center;margin-bottom:28px}
+.denied-brand .logo-mark{display:inline-flex;align-items:center;justify-content:center;width:48px;height:48px;border-radius:12px;background:rgba(209,83,29,.15);border:1px solid rgba(209,83,29,.3);margin-bottom:12px}
+.denied-brand h1{font-size:20px;font-weight:700;color:#F0EEEB}
+.denied-card{background:#242422;border:1px solid #3E3D3A;border-radius:16px;padding:32px 28px;text-align:center;box-shadow:0 16px 48px rgba(0,0,0,.35)}
+.denied-card .title{font-size:18px;font-weight:700;margin-bottom:8px;color:#F0EEEB}
+.denied-card .subtitle{font-size:13px;color:#9E9C98;margin-bottom:24px;line-height:1.5}
+.denied-card .user{font-size:12px;color:#B2DD79;margin-bottom:20px;word-break:break-all}
+.btn-request{display:inline-flex;align-items:center;justify-content:center;gap:8px;background:#B2DD79;color:#1A1A1A;border:none;border-radius:10px;padding:12px 20px;font-size:14px;font-weight:600;cursor:pointer;text-decoration:none;transition:all .2s}
+.btn-request:hover{background:#c5e89a;box-shadow:0 4px 16px rgba(178,221,121,.25)}
+.btn-logout{display:inline-block;margin-top:16px;font-size:12px;color:#9E9C98;text-decoration:none}
+.btn-logout:hover{color:#F0EEEB;text-decoration:underline}
+</style>
+</head>
+<body>
+<div class="denied-bg"><div class="glow g1"></div></div>
+<div class="denied-wrap">
+    <div class="denied-brand">
+        <div class="logo-mark">
+            <svg viewBox="0 0 24 24" fill="none" stroke="#D1531D" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+        </div>
+        <h1>Base Power</h1>
+    </div>
+    <div class="denied-card">
+        <div class="title">Access restricted</div>
+        <div class="subtitle">This dashboard is limited to specific users. You're signed in but don't have access yet.</div>
+        {% if user_email %}<div class="user">Signed in as {{ user_email }}</div>{% endif %}
+        <a href="{{ request_access_url }}" class="btn-request">Request access</a>
+        <a href="/auth/logout" class="btn-logout">Sign out</a>
+    </div>
+</div>
+</body>
+</html>
+"""
+
 
 def _auth_enabled() -> bool:
     return bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET)
@@ -164,6 +218,11 @@ def init_auth(app: Flask) -> None:
             return None
         if not session.get("user_email"):
             return redirect("/auth/login-page")
+        user_email = str(session.get("user_email", "") or "").strip().lower()
+        if user_email:
+            settings, _ = load_settings_with_access_defaults(bootstrap_user_email=user_email)
+            if not user_can_access(user_email, settings):
+                return redirect("/auth/access-denied")
         return None
 
     @app.route("/auth/login-page")
@@ -272,6 +331,32 @@ def init_auth(app: Flask) -> None:
         session["user_name"] = user_info.get("name", email)
         session["user_picture"] = user_info.get("picture", "")
         return redirect("/")
+
+    @app.route("/auth/access-denied")
+    def auth_access_denied():
+        """Show access denied page with option to request access from owner."""
+        from access_control import get_access_context, load_settings_with_access_defaults
+        user_email = str(session.get("user_email", "") or "")
+        settings, _ = load_settings_with_access_defaults(bootstrap_user_email=user_email)
+        ctx = get_access_context(settings, user_email=user_email)
+        owner = ctx.get("owner_email", "")
+        subject = "Request access to Base Power CAPEX Dashboard"
+        body = (
+            f"Hi,\n\nI would like to request access to the Base Power Manufacturing CAPEX Dashboard.\n\n"
+            f"My email: {user_email}\n\n"
+            f"Please add me to the allowed users list in Settings > Access Control.\n\n"
+            f"Thank you."
+        )
+        request_access_url = (
+            f"mailto:{owner}?subject={_url_quote(subject)}&body={_url_quote(body)}"
+            if owner
+            else "#"
+        )
+        return render_template_string(
+            ACCESS_DENIED_HTML,
+            user_email=user_email or None,
+            request_access_url=request_access_url,
+        )
 
     @app.route("/auth/logout")
     def auth_logout():
